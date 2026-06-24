@@ -82,6 +82,7 @@ function evidencePack(text: string, maxChars = 22_000): string {
 function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult {
   const headline = safeString(metadata.extracted_headline ?? metadata.headline ?? metadata.title);
   const author = safeString(metadata.extracted_author ?? metadata.author);
+
   return {
     quality_score: 0,
     summary_alignment_score: 0,
@@ -127,23 +128,67 @@ function extractJson(raw: string): Record<string, unknown> {
 }
 
 function normalizeAiJson(parsed: Record<string, unknown>, metadata: RowRecord, options: ProcessOptions): AiResult {
-  const status = safeString(parsed.ai_verification_status ?? parsed.status ?? parsed.verification_status ?? "UNKNOWN").toUpperCase();
-  const executiveSummary = safeString(parsed.executive_summary ?? parsed.deep_summary ?? parsed.summary);
-  const notes = safeString(parsed.summary_alignment_notes ?? parsed.reasoning ?? parsed.alignment_reasoning);
-  const evidence = normalizeEvidence(parsed.evidence ?? parsed.supporting_evidence ?? parsed.evidence_quotes);
+  const status = safeString(
+    parsed.ai_verification_status ??
+      parsed.status ??
+      parsed.verification_status ??
+      "UNKNOWN"
+  ).toUpperCase();
+
+  const executiveSummary = safeString(
+    parsed.executive_summary ??
+      parsed.deep_summary ??
+      parsed.summary
+  );
+
+  const notes = safeString(
+    parsed.summary_alignment_notes ??
+      parsed.reasoning ??
+      parsed.alignment_reasoning
+  );
+
+  const evidence = normalizeEvidence(
+    parsed.evidence ??
+      parsed.supporting_evidence ??
+      parsed.evidence_quotes
+  );
 
   return {
     quality_score: clampScore(parsed.quality_score, 50),
     summary_alignment_score: clampScore(parsed.summary_alignment_score, 0),
-    extraction_completeness_score: clampScore(parsed.extraction_completeness_score ?? parsed.completeness_score, 0),
-    article_relevance_score: clampScore(parsed.article_relevance_score ?? parsed.relevance_score, 0),
-    source_reliability_score: clampScore(parsed.source_reliability_score ?? parsed.source_score, 0),
-    national_outlet_confidence: clampScore(parsed.national_outlet_confidence, Boolean(parsed.is_national_outlet) ? 75 : 0),
-    outlet_country_confidence: clampScore(parsed.outlet_country_confidence, safeString(parsed.outlet_country) ? 70 : 0),
+    extraction_completeness_score: clampScore(
+      parsed.extraction_completeness_score ?? parsed.completeness_score,
+      0
+    ),
+    article_relevance_score: clampScore(
+      parsed.article_relevance_score ?? parsed.relevance_score,
+      0
+    ),
+    source_reliability_score: clampScore(
+      parsed.source_reliability_score ?? parsed.source_score,
+      0
+    ),
+    national_outlet_confidence: clampScore(
+      parsed.national_outlet_confidence,
+      Boolean(parsed.is_national_outlet) ? 75 : 0
+    ),
+    outlet_country_confidence: clampScore(
+      parsed.outlet_country_confidence,
+      safeString(parsed.outlet_country) ? 70 : 0
+    ),
     status,
     ai_verification_status: status,
-    headline: safeString(parsed.headline ?? metadata.extracted_headline ?? metadata.headline ?? metadata.title),
-    author: safeString(parsed.author ?? metadata.extracted_author ?? metadata.author),
+    headline: safeString(
+      parsed.headline ??
+        metadata.extracted_headline ??
+        metadata.headline ??
+        metadata.title
+    ),
+    author: safeString(
+      parsed.author ??
+        metadata.extracted_author ??
+        metadata.author
+    ),
     is_national_outlet: Boolean(parsed.is_national_outlet),
     outlet_country: safeString(parsed.outlet_country ?? "Unknown") || "Unknown",
     executive_summary: executiveSummary,
