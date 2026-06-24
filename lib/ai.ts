@@ -80,8 +80,53 @@ function evidencePack(text: string, maxChars = 22_000): string {
 }
 
 function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult {
-  const headline = safeString(metadata.extracted_headline ?? metadata.headline ?? metadata.title);
-  const author = safeString(metadata.extracted_author ?? metadata.author);
+  const headline = safeString(
+    metadata.extracted_headline ?? metadata.headline ?? metadata.title
+  );
+
+  const author = safeString(
+    metadata.extracted_author ?? metadata.author
+  );
+
+  return {
+    quality_score: 0,
+    summary_alignment_score: 0,
+
+    extraction_completeness_score: 0,
+    article_relevance_score: 0,
+    source_reliability_score: 0,
+    national_outlet_confidence: 0,
+    outlet_country_confidence: 0,
+
+    status,
+    ai_verification_status: status,
+
+    headline,
+    author,
+
+    is_national_outlet: false,
+    outlet_country: "Unknown",
+
+    executive_summary: "",
+    deep_summary: "",
+
+    reasoning: note,
+    summary_alignment_notes: note,
+
+    key_entities: [],
+    key_quotes: [],
+
+    evidence: [],
+    evidence_json: "[]",
+    evidence_count: 0,
+
+    tone_and_bias: "",
+
+    rubric_version: "archivelens-v3-fallback",
+    model_used: "",
+    provider_used: "unknown",
+    analyzed_at: new Date().toISOString(),
+  };
 
   return {
     quality_score: 0,

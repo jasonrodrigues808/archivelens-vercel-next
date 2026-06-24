@@ -54,6 +54,11 @@ function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult
   return {
     quality_score: 0,
     summary_alignment_score: 0,
+    extraction_completeness_score: 0,
+    article_relevance_score: 0,
+    source_reliability_score: 0,
+    national_outlet_confidence: 0,
+    outlet_country_confidence: 0,
     status,
     ai_verification_status: status,
     headline,
@@ -66,6 +71,9 @@ function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult
     summary_alignment_notes: note,
     key_entities: [],
     key_quotes: [],
+    evidence: [],
+    evidence_json: "[]",
+    evidence_count: 0,
     tone_and_bias: ""
   };
 }

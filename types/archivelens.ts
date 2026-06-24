@@ -128,11 +128,11 @@ export type AiEvidence = {
 export type AiResult = {
   quality_score: number;
   summary_alignment_score: number;
-  extraction_completeness_score: number;
-  article_relevance_score: number;
-  source_reliability_score: number;
-  national_outlet_confidence: number;
-  outlet_country_confidence: number;
+  extraction_completeness_score?: number;
+  article_relevance_score?: number;
+  source_reliability_score?: number;
+  national_outlet_confidence?: number;
+  outlet_country_confidence?: number;
   status: string;
   ai_verification_status: string;
   headline: string;
@@ -145,14 +145,14 @@ export type AiResult = {
   summary_alignment_notes: string;
   key_entities: string[];
   key_quotes: string[];
-  evidence: AiEvidence[];
-  evidence_json: string;
-  evidence_count: number;
+  evidence?: AiEvidence[];
+  evidence_json?: string;
+  evidence_count?: number;
   tone_and_bias: string;
-  rubric_version: string;
-  model_used: string;
-  provider_used: Provider;
-  analyzed_at: string;
+  rubric_version?: string;
+  model_used?: string;
+  provider_used?: Provider;
+  analyzed_at?: string;
 };
 
 export type ProcessStats = {
