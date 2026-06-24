@@ -164,7 +164,7 @@ function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult
 
     rubric_version: "archivelens-v3-fallback",
     model_used: "",
-    provider_used: "huit",
+    provider_used: "unknown",
     analyzed_at: new Date().toISOString(),
   };
 }

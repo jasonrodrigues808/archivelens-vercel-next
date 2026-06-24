@@ -754,23 +754,39 @@ export async function processSingleUrl(rawUrl: string, row: RowRecord, options: 
 function baseResult(row: RowRecord, patch: Partial<ScrapeResult>): ScrapeResult {
   return {
     ...row,
-    quality_label: "failed",
-    error_message: "",
-    fetched_text: "",
-    extracted_headline: "",
-    extracted_author: "",
-    extracted_date: "",
-    extracted_site_name: "",
-    canonical_url: "",
-    recovery_route: "none",
-    http_status: "",
-    source_url_used: "",
-    word_count: 0,
-    char_count: 0,
-    paragraph_count: 0,
-    extraction_score: 0,
-    robots_note: "",
-    elapsed_s: 0,
-    ...patch
+    ...patch,
+
+    quality_label: String(patch.quality_label ?? "failed"),
+    error_message: String(patch.error_message ?? ""),
+    fetched_text: String(patch.fetched_text ?? ""),
+
+    extracted_headline: String(patch.extracted_headline ?? ""),
+    extracted_author: String(patch.extracted_author ?? ""),
+    extracted_date: String(patch.extracted_date ?? ""),
+    extracted_site_name: String(patch.extracted_site_name ?? ""),
+
+    canonical_url: String(patch.canonical_url ?? ""),
+    recovery_route: String(patch.recovery_route ?? "none"),
+    http_status: patch.http_status ?? "",
+    source_url_used: String(patch.source_url_used ?? ""),
+
+    word_count: Number(patch.word_count ?? 0),
+    char_count: Number(patch.char_count ?? 0),
+    paragraph_count: Number(patch.paragraph_count ?? 0),
+    extraction_score: Number(patch.extraction_score ?? 0),
+
+    robots_note: String(patch.robots_note ?? ""),
+    elapsed_s: Number(patch.elapsed_s ?? 0),
+
+    candidate_count: Number(patch.candidate_count ?? 0),
+    winning_candidate_route: String(patch.winning_candidate_route ?? ""),
+    candidate_routes: String(patch.candidate_routes ?? ""),
+    extraction_confidence_label: String(
+      patch.extraction_confidence_label ?? "blocked_or_failed",
+    ),
+
+    boilerplate_ratio: Number(patch.boilerplate_ratio ?? 0),
+    duplicate_paragraph_ratio: Number(patch.duplicate_paragraph_ratio ?? 0),
+    extraction_trace_json: String(patch.extraction_trace_json ?? "[]"),
   };
 }
