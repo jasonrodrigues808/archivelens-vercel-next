@@ -97,3 +97,30 @@ ArchiveLens does not impersonate Googlebot, falsify IP headers, or bypass access
 ## v3.1 crash-resistance patch
 
 This build validates API base URLs before creating provider clients. If you see `The string did not match the expected pattern`, clear the HUIT/OpenAI base URL fields and use the default HUIT endpoint: `https://go.apis.huit.harvard.edu/ais-openai-direct-limited-schools/v1`. API keys belong in key fields or Vercel environment variables, not in base URL fields.
+
+## v3.3 payload-safety patch
+
+This version fixes the browser error:
+
+```text
+Unexpected token 'R', "Request En"... is not valid JSON
+```
+
+That error usually happens when Vercel returns a plain-text `Request Entity Too Large` response while the browser is expecting JSON.
+
+Changes:
+
+- `/api/process` now accepts gzip-compressed JSON request bodies.
+- The frontend automatically gzips large `/api/process` requests when the browser supports `CompressionStream`.
+- The frontend no longer calls `response.json()` directly; non-JSON server responses are shown as readable errors.
+- `/api/process` compacts very large responses so Vercel does not reject the function response payload.
+- Rows whose article text is compacted include `_archivelens_response_compacted = true` and a truncation marker in `fetched_text`.
+
+For very large research datasets, the long-term best architecture is to store full article text in Vercel Blob, Supabase, or Postgres and return only result IDs/previews to the browser.
+
+
+## v3.3 payload fix
+
+This build fixes the browser error `Unexpected token 'R', "Request En"... is not valid JSON` by avoiding giant single API requests. The frontend now sends CSV rows to `/api/process` in safe chunks, the API route accepts chunked `rows` payloads, and large recovered article bodies/traces are clipped for Vercel response safety.
+
+If you still see a payload-size error, remove very large non-URL columns from your CSV or split the dataset into smaller runs.

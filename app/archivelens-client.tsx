@@ -15,6 +15,7 @@ import {
 import { detectSummaryColumn, detectTitleColumn, detectUrlColumn, parseCsvText, unparseCsv } from "@/lib/csv";
 import { duplicateGroupStats } from "@/lib/dedupe";
 import type {
+  DomainHealth,
   ProcessOptions,
   ProcessResponse,
   PromptGeneratorInput,
@@ -72,6 +73,9 @@ const initialOptions: ProcessOptions = {
   huitBaseUrl: "https://go.apis.huit.harvard.edu/ais-openai-direct-limited-schools/v1",
   openaiBaseUrl: ""
 };
+
+const PROCESS_API_SAFE_BYTES = 2_900_000;
+const PROCESS_API_MAX_ROWS_PER_CHUNK = 25;
 
 type ApiTestStatus = "idle" | "testing" | "success" | "error";
 type ApiTestState = Record<Provider, { status: ApiTestStatus; message: string; credentialSource?: string }>;
@@ -143,6 +147,188 @@ async function readApiPayload(response: Response): Promise<Record<string, unknow
 function errorMessageFromPayload(payload: Record<string, unknown>, fallback: string): string {
   const raw = payload.error || payload.message || fallback;
   return String(raw || fallback);
+}
+
+function jsonByteSize(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function chunkRowsForProcess(inputRows: RowRecord[], options: ProcessOptions): RowRecord[][] {
+  const chunks: RowRecord[][] = [];
+  let current: RowRecord[] = [];
+  for (const row of inputRows) {
+    const candidate = [...current, row];
+    const candidateBytes = jsonByteSize({ rows: candidate, options });
+    if (current.length && (candidate.length > PROCESS_API_MAX_ROWS_PER_CHUNK || candidateBytes > PROCESS_API_SAFE_BYTES)) {
+      chunks.push(current);
+      current = [row];
+      const singleBytes = jsonByteSize({ rows: current, options });
+      if (singleBytes > PROCESS_API_SAFE_BYTES) {
+        throw new Error(`One CSV row is too large to send safely to Vercel (${formatBytes(singleBytes)}). Remove very large text/blob columns from the CSV or split the row manually.`);
+      }
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+function columnsFromRows(rows: Array<Record<string, unknown>>): string[] {
+  const ordered = new Set<string>();
+  rows.forEach((row) => Object.keys(row).forEach((key) => ordered.add(key)));
+  return Array.from(ordered);
+}
+
+function domainFromOutputRow(row: Record<string, unknown>): string {
+  const raw = String(row.source_url_used || row.canonical_url || row.url || row.link || "");
+  try {
+    return new URL(raw).hostname.replace(/^www\./, "") || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function averageColumn(rows: Array<Record<string, unknown>>, column: string): number | null {
+  const values = rows.map((row) => Number(row[column])).filter((value) => Number.isFinite(value));
+  if (!values.length) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function buildDomainHealthFromRows(rows: ProcessResponse["rows"]): DomainHealth[] {
+  const groups = new Map<string, ProcessResponse["rows"]>();
+  rows.forEach((row) => {
+    const domain = domainFromOutputRow(row as unknown as Record<string, unknown>);
+    const bucket = groups.get(domain) ?? [];
+    bucket.push(row);
+    groups.set(domain, bucket);
+  });
+  return Array.from(groups.entries()).map(([domain, bucket]) => {
+    const labels = bucket.map((row) => String(row.quality_label ?? ""));
+    return {
+      domain,
+      rows: bucket.length,
+      fullText: labels.filter((label) => label === "full_text").length,
+      partial: labels.filter((label) => ["partial_text", "low_confidence"].includes(label)).length,
+      failed: labels.filter((label) => ["failed", "url_only"].includes(label)).length,
+      botBlocked: labels.filter((label) => label === "bot_blocked").length,
+      authRequired: labels.filter((label) => label === "auth_required").length,
+      rateLimited: labels.filter((label) => label === "rate_limited").length,
+      robotsDisallowed: labels.filter((label) => label === "robots_disallowed").length,
+      averageExtractionScore: Math.round((averageColumn(bucket as unknown as Array<Record<string, unknown>>, "extraction_score") ?? 0) * 10) / 10,
+      averageQualityScore: Math.round((averageColumn(bucket as unknown as Array<Record<string, unknown>>, "quality_score") ?? 0) * 10) / 10,
+      averageAlignmentScore: Math.round((averageColumn(bucket as unknown as Array<Record<string, unknown>>, "summary_alignment_score") ?? 0) * 10) / 10
+    } satisfies DomainHealth;
+  }).sort((a, b) => b.rows - a.rows || b.fullText - a.fullText || a.domain.localeCompare(b.domain));
+}
+
+function mergeProcessResponses(responses: ProcessResponse[], startedAt: number, options: ProcessOptions): ProcessResponse {
+  const rows = responses.flatMap((response) => response.rows);
+  const logs = responses.flatMap((response, index) => [`chunk ${index + 1}/${responses.length} complete`, ...response.logs]);
+  const columns = columnsFromRows(rows as unknown as Array<Record<string, unknown>>);
+  const aiCalls = responses.reduce((sum, response) => sum + response.stats.aiCalls, 0);
+  const aiCallsSaved = responses.reduce((sum, response) => sum + response.stats.aiCallsSaved, 0);
+  const representativeJobs = responses.reduce((sum, response) => sum + response.stats.representativeJobs, 0);
+  const duplicateRequestsSaved = responses.reduce((sum, response) => sum + response.stats.duplicateRequestsSaved, 0);
+  return {
+    runId: `client_run_${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}_${Math.random().toString(36).slice(2, 7)}`,
+    createdAt: new Date().toISOString(),
+    rows,
+    stats: {
+      inputRows: rows.length,
+      representativeJobs,
+      duplicateRequestsSaved,
+      fullTextRows: rows.filter((row) => row.quality_label === "full_text").length,
+      partialRows: rows.filter((row) => ["partial_text", "low_confidence"].includes(String(row.quality_label))).length,
+      failedRows: rows.filter((row) => ["failed", "url_only", "robots_disallowed", "rate_limited"].includes(String(row.quality_label))).length,
+      botBlockedRows: rows.filter((row) => row.quality_label === "bot_blocked").length,
+      authRequiredRows: rows.filter((row) => row.quality_label === "auth_required").length,
+      aiCalls,
+      aiCallsSaved,
+      elapsedMs: Date.now() - startedAt
+    },
+    domainHealth: buildDomainHealthFromRows(rows),
+    logs,
+    columns,
+    settingsSnapshot: responses[0]?.settingsSnapshot ?? {
+      urlColumn: options.urlColumn,
+      titleColumn: options.titleColumn,
+      summaryColumn: options.summaryColumn,
+      duplicateGroupColumn: options.duplicateGroupColumn,
+      recoveryRoute: options.recoveryRoute,
+      performanceProfile: options.performanceProfile,
+      concurrency: options.concurrency,
+      retries: options.retries,
+      timeoutMs: options.timeoutMs,
+      minChars: options.minChars,
+      respectRobots: options.respectRobots,
+      useJina: options.useJina,
+      useWayback: options.useWayback,
+      enableAI: options.enableAI,
+      reuseDuplicateAI: options.reuseDuplicateAI,
+      aiProvider: options.aiProvider,
+      aiModel: options.aiModel
+    }
+  };
+}
+
+const VERCEL_REQUEST_WARNING_BYTES = 3_800_000;
+const VERCEL_REQUEST_HARD_BYTES = 4_300_000;
+
+type ApiPostResult = {
+  response: Response;
+  payload: Record<string, unknown>;
+  rawBytes: number;
+  sentBytes: number;
+  compressed: boolean;
+};
+
+async function gzipJsonString(json: string): Promise<Blob> {
+  if (typeof CompressionStream === "undefined") {
+    throw new Error("This browser cannot gzip large requests automatically. Use Chrome/Edge, or run a smaller CSV batch.");
+  }
+
+  const stream = new CompressionStream("gzip");
+  const writer = stream.writable.getWriter();
+  await writer.write(new TextEncoder().encode(json));
+  await writer.close();
+  return await new Response(stream.readable).blob();
+}
+
+async function postJson(path: string, payloadInput: unknown): Promise<ApiPostResult> {
+  const json = JSON.stringify(payloadInput);
+  const rawBytes = new TextEncoder().encode(json).byteLength;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  let body: BodyInit = json;
+  let sentBytes = rawBytes;
+  let compressed = false;
+
+  if (rawBytes > VERCEL_REQUEST_WARNING_BYTES) {
+    const compressedBody = await gzipJsonString(json);
+    sentBytes = compressedBody.size;
+    compressed = true;
+    headers["Content-Encoding"] = "gzip";
+    headers["X-ArchiveLens-Raw-Bytes"] = String(rawBytes);
+    headers["X-ArchiveLens-Compressed-Bytes"] = String(sentBytes);
+    body = compressedBody;
+  }
+
+  if (sentBytes > VERCEL_REQUEST_HARD_BYTES) {
+    throw new Error(
+      `This request is too large for a single Vercel Function call (${(sentBytes / 1_000_000).toFixed(2)} MB sent, ${(rawBytes / 1_000_000).toFixed(2)} MB raw). ` +
+      "Run a smaller CSV batch, remove unused columns, or split the dataset. A future database/blob-backed queue can handle larger files."
+    );
+  }
+
+  const response = await fetch(path, { method: "POST", headers, body });
+  const payload = await readApiPayload(response);
+  return { response, payload, rawBytes, sentBytes, compressed };
 }
 
 function compact(value: unknown, max = 180): string {
@@ -309,6 +495,7 @@ export default function ArchiveLensClient() {
   const [options, setOptions] = useState<ProcessOptions>(initialOptions);
   const [result, setResult] = useState<ProcessResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [runStatus, setRunStatus] = useState("");
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [minQuality, setMinQuality] = useState(0);
@@ -550,12 +737,7 @@ export default function ArchiveLensClient() {
     };
 
     try {
-      const response = await fetch("/api/test-ai", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ options: testOptions })
-      });
-      const payload = await readApiPayload(response);
+      const { response, payload } = await postJson("/api/test-ai", { options: testOptions });
       if (!response.ok || !payload.ok) throw new Error(errorMessageFromPayload(payload, "Connection failed."));
       setApiTest((prev) => ({
         ...prev,
@@ -592,12 +774,7 @@ export default function ArchiveLensClient() {
         return;
       }
 
-      const response = await fetch("/api/generate-prompt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: promptInput, options: { ...options, enableAI: true } })
-      });
-      const payload = await readApiPayload(response);
+      const { response, payload } = await postJson("/api/generate-prompt", { input: promptInput, options: { ...options, enableAI: true } });
       if (!response.ok) throw new Error(errorMessageFromPayload(payload, "Prompt generation failed."));
       setGeneratedPrompt(payload as PromptGeneratorResult);
     } catch (err) {
@@ -616,18 +793,34 @@ export default function ArchiveLensClient() {
       if (options.enableAI && !activeApiReady(options)) {
         throw new Error("AI is enabled, but no manual API key is entered for the selected provider. Enter a key or switch API credential mode to environment variables.");
       }
-      if (!rows.length || !csvText.trim()) throw new Error("Upload a CSV first.");
+      if (!rows.length) throw new Error("Upload a CSV first.");
       if (!options.urlColumn) throw new Error("Choose a URL column before running.");
 
-      const response = await fetch("/api/process", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ csvText, options })
-      });
+      const chunks = chunkRowsForProcess(rows, options);
+      const responses: ProcessResponse[] = [];
+      const startedAt = Date.now();
+      setRunStatus(`Prepared ${chunks.length.toLocaleString()} safe Vercel request chunk${chunks.length === 1 ? "" : "s"}.`);
 
-      const payload = await readApiPayload(response);
-      if (!response.ok) throw new Error(errorMessageFromPayload(payload, "Pipeline failed."));
-      const completed = payload as ProcessResponse;
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunk = chunks[i];
+        setRunStatus(`Processing chunk ${i + 1}/${chunks.length} (${chunk.length.toLocaleString()} rows).`);
+        const response = await fetch("/api/process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rows: chunk, options })
+        });
+        const payload = await readApiPayload(response);
+        if (!response.ok) {
+          const message = errorMessageFromPayload(payload, "Pipeline failed.");
+          if (/request ent/i.test(message) || response.status === 413) {
+            throw new Error(`Vercel rejected a request as too large. ArchiveLens already chunks the CSV, so reduce the CSV width, remove large text/blob columns, or lower the data size. Server said: ${message}`);
+          }
+          throw new Error(message);
+        }
+        responses.push(payload as ProcessResponse);
+      }
+
+      const completed = mergeProcessResponses(responses, startedAt, options);
       setResult(completed);
       setRunHistory((prev) => [
         {
@@ -648,6 +841,7 @@ export default function ArchiveLensClient() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
+      setRunStatus("");
       setLoading(false);
     }
   }
@@ -1009,7 +1203,7 @@ export default function ArchiveLensClient() {
           </div>
           {error && <div className="error section-tight">{error}</div>}
           {result && <div className="success section-tight">Pipeline complete in {(result.stats.elapsedMs / 1000).toFixed(1)}s. Saved {result.stats.duplicateRequestsSaved.toLocaleString()} scrape requests and {result.stats.aiCallsSaved.toLocaleString()} AI calls.</div>}
-          {loading && <div className="loading-panel section-tight"><span className="spinner" /> Processing on /api/process. Results appear when the Vercel Function returns.</div>}
+          {loading && <div className="loading-panel section-tight"><span className="spinner" /> {runStatus || "Processing on /api/process. Results appear when the Vercel Function returns."}</div>}
         </div>
       </section>
 
