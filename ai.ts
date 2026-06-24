@@ -667,8 +667,8 @@ function localPromptFromInput(
   const strictnessRule =
     input.strictness === "strict"
       ? "Apply maximum precision. Flag anything ambiguous as NEEDS_MANUAL_REVIEW."
-      : input.strictness === "lenient"
-      ? "Allow reasonable inferences for partial or slightly ambiguous pages."
+      : input.strictness === "creative"
+      ? "Allow thoughtful synthesis, but every claim must still be grounded in visible recovered text."
       : "Balance precision with practical judgment for mixed-quality media archives.";
 
   const mustIncludeBlock = include
