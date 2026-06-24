@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Document,
   HeadingLevel,
@@ -75,10 +75,44 @@ const initialOptions: ProcessOptions = {
 
 type ApiTestStatus = "idle" | "testing" | "success" | "error";
 type ApiTestState = Record<Provider, { status: ApiTestStatus; message: string; credentialSource?: string }>;
-type ResultPanel = "table" | "reader" | "log" | "guide";
+type ResultPanel = "table" | "reader" | "trace" | "domains" | "review" | "history" | "log" | "guide";
 type NationalFilter = "any" | "national" | "not-national";
-type SortMode = "quality-desc" | "alignment-desc" | "words-desc" | "headline-asc" | "country-asc";
+type SortMode = "quality-desc" | "alignment-desc" | "words-desc" | "headline-asc" | "country-asc" | "extraction-desc";
 type FilterPreset = "all" | "high-quality" | "us-national" | "manual-review" | "bot-blocked" | "low-alignment";
+
+type ReviewStatus = "unreviewed" | "approved" | "rejected" | "needs-better-scrape" | "important";
+type ReviewFilter = "any" | ReviewStatus;
+type SavedFilterView = {
+  id: string;
+  name: string;
+  createdAt: string;
+  filters: {
+    search: string;
+    minQuality: number;
+    minAlignment: number;
+    minWords: number;
+    nationalFilter: NationalFilter;
+    countryFilter: string;
+    recoveryFilter: string;
+    statusFilter: string;
+    sortMode: SortMode;
+    onlyDuplicateGroups: boolean;
+    reviewFilter: ReviewFilter;
+  };
+};
+type RunHistoryEntry = {
+  runId: string;
+  createdAt: string;
+  rows: number;
+  fullTextRows: number;
+  failedRows: number;
+  botBlockedRows: number;
+  aiCalls: number;
+  duplicateRequestsSaved: number;
+  elapsedMs: number;
+  settingsSnapshot?: Record<string, unknown>;
+};
+type PromptLibraryItem = { id: string; name: string; prompt: string; kind: PromptKind; createdAt: string };
 
 function defaultModelFor(provider: Provider): string {
   return modelOptionsByProvider[provider][0];
@@ -94,6 +128,21 @@ function downloadBlob(filename: string, content: BlobPart, type: string): void {
   anchor.click();
   anchor.remove();
   URL.revokeObjectURL(url);
+}
+
+async function readApiPayload(response: Response): Promise<Record<string, unknown>> {
+  const text = await response.text();
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return { error: text.slice(0, 2000) };
+  }
+}
+
+function errorMessageFromPayload(payload: Record<string, unknown>, fallback: string): string {
+  const raw = payload.error || payload.message || fallback;
+  return String(raw || fallback);
 }
 
 function compact(value: unknown, max = 180): string {
@@ -135,6 +184,45 @@ function isUnitedStatesCountry(value: unknown): boolean {
 
 function rowHeadline(row: RowRecord): string {
   return compact(row.headline || row.extracted_headline || row.title || row.name || "Untitled article", 140);
+}
+
+function rowKey(row: RowRecord, index = 0): string {
+  return [
+    row.source_url_used || row.canonical_url || row.url || row.link || "",
+    row.extracted_headline || row.headline || row.title || "",
+    row._archivelens_dedupe_key || "",
+    index
+  ].join("::");
+}
+
+function parseJsonArray<T>(value: unknown): T[] {
+  if (Array.isArray(value)) return value as T[];
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readLocal<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeLocal<T>(key: string, value: T): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage quota and private mode failures.
+  }
 }
 
 function averageScore(rows: RowRecord[], column: string): number | null {
@@ -232,8 +320,15 @@ export default function ArchiveLensClient() {
   const [statusFilter, setStatusFilter] = useState("Any");
   const [sortMode, setSortMode] = useState<SortMode>("quality-desc");
   const [onlyDuplicateGroups, setOnlyDuplicateGroups] = useState(false);
+  const [reviewFilter, setReviewFilter] = useState<ReviewFilter>("any");
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
   const [resultPanel, setResultPanel] = useState<ResultPanel>("table");
+  const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>([]);
+  const [savedFilterViews, setSavedFilterViews] = useState<SavedFilterView[]>([]);
+  const [filterViewName, setFilterViewName] = useState("High-confidence review set");
+  const [reviewLabels, setReviewLabels] = useState<Record<string, ReviewStatus>>({});
+  const [promptLibrary, setPromptLibrary] = useState<PromptLibraryItem[]>([]);
+  const [promptLibraryName, setPromptLibraryName] = useState("Climate misinformation rubric");
   const [apiTest, setApiTest] = useState<ApiTestState>({
     huit: { status: "idle", message: "Not tested yet." },
     openai: { status: "idle", message: "Not tested yet." },
@@ -251,6 +346,18 @@ export default function ArchiveLensClient() {
   const [generatedPrompt, setGeneratedPrompt] = useState<PromptGeneratorResult | null>(null);
   const [promptLoading, setPromptLoading] = useState(false);
   const [promptError, setPromptError] = useState("");
+
+  useEffect(() => {
+    setRunHistory(readLocal<RunHistoryEntry[]>("archivelens:v3:runHistory", []));
+    setSavedFilterViews(readLocal<SavedFilterView[]>("archivelens:v3:savedFilters", []));
+    setReviewLabels(readLocal<Record<string, ReviewStatus>>("archivelens:v3:reviewLabels", {}));
+    setPromptLibrary(readLocal<PromptLibraryItem[]>("archivelens:v3:promptLibrary", []));
+  }, []);
+
+  useEffect(() => writeLocal("archivelens:v3:runHistory", runHistory), [runHistory]);
+  useEffect(() => writeLocal("archivelens:v3:savedFilters", savedFilterViews), [savedFilterViews]);
+  useEffect(() => writeLocal("archivelens:v3:reviewLabels", reviewLabels), [reviewLabels]);
+  useEffect(() => writeLocal("archivelens:v3:promptLibrary", promptLibrary), [promptLibrary]);
 
   const stats = useMemo(
     () => duplicateGroupStats(rows, options.duplicateGroupColumn || "None"),
@@ -321,6 +428,10 @@ export default function ArchiveLensClient() {
       if (recoveryFilter !== "Any" && String(row.quality_label ?? "") !== recoveryFilter) return false;
       if (statusFilter !== "Any" && String(row.status ?? row.ai_verification_status ?? "not analyzed") !== statusFilter) return false;
       if (onlyDuplicateGroups && numberValue(row._archivelens_dedupe_group_size, 1) < 2) return false;
+      if (reviewFilter !== "any") {
+        const review = reviewLabels[rowKey(row)] || "unreviewed";
+        if (review !== reviewFilter) return false;
+      }
 
       return true;
     });
@@ -328,26 +439,31 @@ export default function ArchiveLensClient() {
     return [...rowsAfterFilter].sort((a, b) => {
       if (sortMode === "quality-desc") return numberValue(b.quality_score, 0) - numberValue(a.quality_score, 0);
       if (sortMode === "alignment-desc") return numberValue(b.summary_alignment_score, 0) - numberValue(a.summary_alignment_score, 0);
+      if (sortMode === "extraction-desc") return numberValue(b.extraction_score, 0) - numberValue(a.extraction_score, 0);
       if (sortMode === "words-desc") return numberValue(b.word_count, 0) - numberValue(a.word_count, 0);
       if (sortMode === "headline-asc") return rowHeadline(a).localeCompare(rowHeadline(b));
       if (sortMode === "country-asc") return normalizedCountry(a.outlet_country).localeCompare(normalizedCountry(b.outlet_country));
       return 0;
     });
-  }, [outputRows, search, minQuality, minAlignment, minWords, nationalFilter, countryFilter, recoveryFilter, statusFilter, onlyDuplicateGroups, sortMode]);
+  }, [outputRows, search, minQuality, minAlignment, minWords, nationalFilter, countryFilter, recoveryFilter, statusFilter, onlyDuplicateGroups, reviewFilter, reviewLabels, sortMode]);
 
   const filteredStats = useMemo(() => {
     const fullText = filteredRows.filter((row) => row.quality_label === "full_text").length;
     const national = filteredRows.filter((row) => boolValue(row.is_national_outlet)).length;
     const usNational = filteredRows.filter((row) => boolValue(row.is_national_outlet) && isUnitedStatesCountry(row.outlet_country)).length;
+    const approved = filteredRows.filter((row) => (reviewLabels[rowKey(row)] || "unreviewed") === "approved").length;
+    const needsReview = filteredRows.filter((row) => ["needs-better-scrape", "unreviewed"].includes(reviewLabels[rowKey(row)] || "unreviewed")).length;
     return {
       filteredCount: filteredRows.length,
       fullText,
       national,
       usNational,
+      approved,
+      needsReview,
       meanQuality: averageScore(filteredRows, "quality_score"),
       meanAlignment: averageScore(filteredRows, "summary_alignment_score")
     };
-  }, [filteredRows]);
+  }, [filteredRows, reviewLabels]);
 
   const selectedRow = filteredRows.length ? filteredRows[Math.min(selectedRowIndex, filteredRows.length - 1)] : null;
 
@@ -362,6 +478,10 @@ export default function ArchiveLensClient() {
     "headline",
     "source_url_used",
     "recovery_route",
+    "extraction_score",
+    "extraction_confidence_label",
+    "candidate_count",
+    "winning_candidate_route",
     "word_count",
     "_archivelens_dedupe_group_size",
     "executive_summary",
@@ -435,14 +555,14 @@ export default function ArchiveLensClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ options: testOptions })
       });
-      const payload = await response.json();
-      if (!response.ok || !payload.ok) throw new Error(payload.message || payload.error || "Connection failed.");
+      const payload = await readApiPayload(response);
+      if (!response.ok || !payload.ok) throw new Error(errorMessageFromPayload(payload, "Connection failed."));
       setApiTest((prev) => ({
         ...prev,
         [provider]: {
           status: "success",
-          message: `${payload.message || "Connected."} (${payload.credentialSource || "key"})`,
-          credentialSource: payload.credentialSource
+          message: `${String(payload.message || "Connected.")} (${String(payload.credentialSource || "key")})`,
+          credentialSource: String(payload.credentialSource || "key")
         }
       }));
     } catch (err) {
@@ -477,8 +597,8 @@ export default function ArchiveLensClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: promptInput, options: { ...options, enableAI: true } })
       });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Prompt generation failed.");
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(errorMessageFromPayload(payload, "Prompt generation failed."));
       setGeneratedPrompt(payload as PromptGeneratorResult);
     } catch (err) {
       setPromptError(err instanceof Error ? err.message : String(err));
@@ -505,9 +625,25 @@ export default function ArchiveLensClient() {
         body: JSON.stringify({ csvText, options })
       });
 
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error || "Pipeline failed.");
-      setResult(payload as ProcessResponse);
+      const payload = await readApiPayload(response);
+      if (!response.ok) throw new Error(errorMessageFromPayload(payload, "Pipeline failed."));
+      const completed = payload as ProcessResponse;
+      setResult(completed);
+      setRunHistory((prev) => [
+        {
+          runId: completed.runId,
+          createdAt: completed.createdAt,
+          rows: completed.rows.length,
+          fullTextRows: completed.stats.fullTextRows,
+          failedRows: completed.stats.failedRows,
+          botBlockedRows: completed.stats.botBlockedRows,
+          aiCalls: completed.stats.aiCalls,
+          duplicateRequestsSaved: completed.stats.duplicateRequestsSaved,
+          elapsedMs: completed.stats.elapsedMs,
+          settingsSnapshot: completed.settingsSnapshot as Record<string, unknown>
+        },
+        ...prev.filter((entry) => entry.runId !== completed.runId)
+      ].slice(0, 30));
       setResultPanel("table");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -527,6 +663,7 @@ export default function ArchiveLensClient() {
     setStatusFilter("Any");
     setSortMode("quality-desc");
     setOnlyDuplicateGroups(false);
+    setReviewFilter("any");
     setSelectedRowIndex(0);
   }
 
@@ -552,6 +689,60 @@ export default function ArchiveLensClient() {
       setSortMode("alignment-desc");
       setSearch("FAILED_SUMMARY_ALIGNMENT");
     }
+  }
+
+  function currentFilterView(name = filterViewName): SavedFilterView {
+    return {
+      id: `filter_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: name.trim() || "Saved filter",
+      createdAt: new Date().toISOString(),
+      filters: { search, minQuality, minAlignment, minWords, nationalFilter, countryFilter, recoveryFilter, statusFilter, sortMode, onlyDuplicateGroups, reviewFilter }
+    };
+  }
+
+  function saveCurrentFilterView() {
+    const view = currentFilterView();
+    setSavedFilterViews((prev) => [view, ...prev].slice(0, 24));
+  }
+
+  function applySavedFilterView(view: SavedFilterView) {
+    setSearch(view.filters.search);
+    setMinQuality(view.filters.minQuality);
+    setMinAlignment(view.filters.minAlignment);
+    setMinWords(view.filters.minWords);
+    setNationalFilter(view.filters.nationalFilter);
+    setCountryFilter(view.filters.countryFilter);
+    setRecoveryFilter(view.filters.recoveryFilter);
+    setStatusFilter(view.filters.statusFilter);
+    setSortMode(view.filters.sortMode);
+    setOnlyDuplicateGroups(view.filters.onlyDuplicateGroups);
+    setReviewFilter(view.filters.reviewFilter || "any");
+  }
+
+  function setReviewForRow(row: RowRecord, status: ReviewStatus) {
+    const key = rowKey(row);
+    setReviewLabels((prev) => ({ ...prev, [key]: status }));
+  }
+
+  function savePromptToLibrary() {
+    if (!generatedPrompt?.prompt) return;
+    const item: PromptLibraryItem = {
+      id: `prompt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: promptLibraryName.trim() || "Saved prompt",
+      prompt: generatedPrompt.prompt,
+      kind: promptInput.promptKind,
+      createdAt: new Date().toISOString()
+    };
+    setPromptLibrary((prev) => [item, ...prev].slice(0, 30));
+  }
+
+  function exportAuditJson() {
+    if (!result) return;
+    downloadBlob(
+      "archivelens_audit_package.json",
+      JSON.stringify({ result, savedFilterViews, reviewLabels, runHistory }, null, 2),
+      "application/json;charset=utf-8"
+    );
   }
 
   async function downloadDocx(rowsToExport?: RowRecord[]) {
@@ -781,9 +972,14 @@ export default function ArchiveLensClient() {
             <TextAreaField label="Must avoid" help="Mistakes, topics, or behaviors the generated prompt must guard against." value={promptInput.mustAvoid || ""} onChange={(value) => updatePrompt("mustAvoid", value)} />
           </div>
           <Switch checked={Boolean(promptInput.useConnectedAI)} onChange={(checked) => updatePrompt("useConnectedAI", checked)} label="Use connected AI to refine prompt" help="If disabled, ArchiveLens generates a strong local template without spending API credits. If enabled but no key is available, it falls back to local generation." />
+          <div className="grid two section-tight">
+            <TextField label="Prompt library name" help="Name the generated prompt before saving it to your browser prompt library." value={promptLibraryName} onChange={setPromptLibraryName} />
+            <SelectField label="Load saved prompt" help="Use a previously saved prompt as the active AI rubric." value="" onChange={(value) => { const item = promptLibrary.find((entry) => entry.id === value); if (item) updateOption("customRubric", item.prompt); }} options={[{ value: "", label: "Choose saved prompt" }, ...promptLibrary.map((item) => ({ value: item.id, label: item.name }))]} />
+          </div>
           <div className="button-row section-tight">
             <button className="btn" onClick={generatePrompt} disabled={promptLoading}>{promptLoading ? "Generating..." : "Generate prompt"}</button>
             <button className="btn secondary" disabled={!generatedPrompt?.prompt} onClick={() => generatedPrompt && updateOption("customRubric", generatedPrompt.prompt)}>Use as AI rubric</button>
+            <button className="btn secondary" disabled={!generatedPrompt?.prompt} onClick={savePromptToLibrary}>Save prompt</button>
             <button className="btn secondary" disabled={!generatedPrompt?.prompt} onClick={() => generatedPrompt && navigator.clipboard.writeText(generatedPrompt.prompt)}>Copy</button>
           </div>
           {promptError && <div className="error section-tight">{promptError}</div>}
@@ -808,6 +1004,7 @@ export default function ArchiveLensClient() {
               <button className="btn secondary" disabled={!result?.rows.length} onClick={() => result && downloadBlob("archivelens_processed.csv", unparseCsv(result.rows), "text/csv;charset=utf-8")}>CSV</button>
               <button className="btn secondary" disabled={!result?.rows.length} onClick={() => result && downloadBlob("archivelens_processed.jsonl", result.rows.map((row) => JSON.stringify(row)).join("\n"), "application/jsonl;charset=utf-8")}>JSONL</button>
               <button className="btn secondary" disabled={!result?.rows.length} onClick={() => downloadDocx()}>DOCX</button>
+              <button className="btn secondary" disabled={!result?.rows.length} onClick={exportAuditJson}>Audit JSON</button>
             </div>
           </div>
           {error && <div className="error section-tight">{error}</div>}
@@ -827,6 +1024,10 @@ export default function ArchiveLensClient() {
             <div className="segmented">
               <button className={resultPanel === "table" ? "seg active" : "seg"} onClick={() => setResultPanel("table")}>Table</button>
               <button className={resultPanel === "reader" ? "seg active" : "seg"} onClick={() => setResultPanel("reader")}>Article viewer</button>
+              <button className={resultPanel === "trace" ? "seg active" : "seg"} onClick={() => setResultPanel("trace")}>Trace</button>
+              <button className={resultPanel === "domains" ? "seg active" : "seg"} onClick={() => setResultPanel("domains")}>Domains</button>
+              <button className={resultPanel === "review" ? "seg active" : "seg"} onClick={() => setResultPanel("review")}>Review</button>
+              <button className={resultPanel === "history" ? "seg active" : "seg"} onClick={() => setResultPanel("history")}>History</button>
               <button className={resultPanel === "log" ? "seg active" : "seg"} onClick={() => setResultPanel("log")}>Log</button>
               <button className={resultPanel === "guide" ? "seg active" : "seg"} onClick={() => setResultPanel("guide")}>Guide</button>
             </div>
@@ -837,6 +1038,7 @@ export default function ArchiveLensClient() {
             <Metric label="Mean quality" value={filteredStats.meanQuality === null ? "--" : filteredStats.meanQuality.toFixed(1)} caption="after filters" />
             <Metric label="Mean alignment" value={filteredStats.meanAlignment === null ? "--" : filteredStats.meanAlignment.toFixed(1)} caption="after filters" />
             <Metric label="US national" value={filteredStats.usNational.toLocaleString()} caption={`${filteredStats.national.toLocaleString()} national outlets`} />
+            <Metric label="Approved" value={filteredStats.approved.toLocaleString()} caption={`${filteredStats.needsReview.toLocaleString()} still need review`} />
           </div>
 
           <div className="filter-console section-tight">
@@ -845,7 +1047,15 @@ export default function ArchiveLensClient() {
                 <div className="eyebrow">Filter builder</div>
                 <h3>Slice the output without leaving the app</h3>
               </div>
-              <button className="btn secondary" onClick={resetResultFilters}>Reset filters</button>
+              <div className="button-row">
+                <button className="btn secondary" onClick={saveCurrentFilterView}>Save view</button>
+                <button className="btn secondary" onClick={resetResultFilters}>Reset filters</button>
+              </div>
+            </div>
+
+            <div className="grid two section-tight">
+              <TextField label="Saved view name" help="Save the current filters so you can reuse the same research subset later." value={filterViewName} onChange={setFilterViewName} />
+              <SelectField label="Load saved view" help="Applies a saved filter preset from this browser." value="" onChange={(value) => { const view = savedFilterViews.find((entry) => entry.id === value); if (view) applySavedFilterView(view); }} options={[{ value: "", label: "Choose saved view" }, ...savedFilterViews.map((view) => ({ value: view.id, label: view.name }))]} />
             </div>
 
             <div className="preset-row">
@@ -865,9 +1075,11 @@ export default function ArchiveLensClient() {
               <SelectField label="Outlet country" help="Choose United States to isolate US-based news sources, or use Any for all countries." value={countryFilter} onChange={setCountryFilter} options={countryOptions} />
               <SelectField label="Recovery label" help="Filter by scraper result: full_text, partial_text, bot_blocked, auth_required, failed, and so on." value={recoveryFilter} onChange={setRecoveryFilter} options={recoveryOptions} />
               <SelectField label="AI status" help="Filter by AI verification status, such as VERIFIED_PASSED or NEEDS_MANUAL_REVIEW." value={statusFilter} onChange={setStatusFilter} options={statusOptions} />
+              <SelectField label="Review label" help="Filter by your manual review decisions saved in this browser." value={reviewFilter} onChange={(value) => setReviewFilter(value as ReviewFilter)} options={[{ value: "any", label: "Any" }, { value: "unreviewed", label: "Unreviewed" }, { value: "approved", label: "Approved" }, { value: "important", label: "Important" }, { value: "needs-better-scrape", label: "Needs better scrape" }, { value: "rejected", label: "Rejected" }]} />
               <SelectField label="Sort by" help="Controls the table and article viewer order." value={sortMode} onChange={(value) => setSortMode(value as SortMode)} options={[
                 { value: "quality-desc", label: "Quality score: high to low" },
                 { value: "alignment-desc", label: "Alignment score: high to low" },
+                { value: "extraction-desc", label: "Extraction score: high to low" },
                 { value: "words-desc", label: "Word count: high to low" },
                 { value: "headline-asc", label: "Headline: A to Z" },
                 { value: "country-asc", label: "Country: A to Z" }
@@ -916,10 +1128,16 @@ export default function ArchiveLensClient() {
               rows={filteredRows}
               selectedIndex={Math.min(selectedRowIndex, Math.max(filteredRows.length - 1, 0))}
               selectedRow={selectedRow}
+              reviewLabels={reviewLabels}
+              onReview={setReviewForRow}
               onSelect={setSelectedRowIndex}
             />
           )}
 
+          {resultPanel === "trace" && <TracePanel rows={filteredRows} />}
+          {resultPanel === "domains" && <DomainHealthPanel domainHealth={result.domainHealth || []} />}
+          {resultPanel === "review" && <ReviewQueue rows={filteredRows} reviewLabels={reviewLabels} onReview={setReviewForRow} />}
+          {resultPanel === "history" && <RunHistoryPanel runHistory={runHistory} />}
           {resultPanel === "log" && <pre className="logbox">{result.logs.slice(-180).join("\n")}</pre>}
           {resultPanel === "guide" && <GuidePanel />}
         </section>
@@ -928,7 +1146,7 @@ export default function ArchiveLensClient() {
   );
 }
 
-function ArticleViewer({ rows, selectedIndex, selectedRow, onSelect }: { rows: RowRecord[]; selectedIndex: number; selectedRow: RowRecord | null; onSelect: (index: number) => void }) {
+function ArticleViewer({ rows, selectedIndex, selectedRow, reviewLabels, onReview, onSelect }: { rows: RowRecord[]; selectedIndex: number; selectedRow: RowRecord | null; reviewLabels: Record<string, ReviewStatus>; onReview: (row: RowRecord, status: ReviewStatus) => void; onSelect: (index: number) => void }) {
   if (!rows.length || !selectedRow) {
     return <div className="empty-state section-tight">No rows match the current filters. Reset filters or broaden the score thresholds.</div>;
   }
@@ -937,6 +1155,9 @@ function ArticleViewer({ rows, selectedIndex, selectedRow, onSelect }: { rows: R
   const summary = String(selectedRow.executive_summary ?? selectedRow.deep_summary ?? "").trim();
   const reasoning = String(selectedRow.reasoning ?? selectedRow.summary_alignment_notes ?? "").trim();
   const sourceUrl = String(selectedRow.source_url_used || selectedRow.canonical_url || selectedRow.url || selectedRow.link || "");
+  const trace = parseJsonArray<Record<string, unknown>>(selectedRow.extraction_trace_json);
+  const evidence = parseJsonArray<Record<string, unknown>>(selectedRow.evidence_json);
+  const reviewStatus = reviewLabels[rowKey(selectedRow)] || "unreviewed";
 
   return (
     <div className="reader-console section-tight">
@@ -952,6 +1173,14 @@ function ArticleViewer({ rows, selectedIndex, selectedRow, onSelect }: { rows: R
           </select>
         </label>
         <button className="btn secondary" disabled={!fullText} onClick={() => navigator.clipboard.writeText(fullText)}>Copy full text</button>
+        <span className={pillClass(reviewStatus)}>Review: {reviewStatus}</span>
+      </div>
+      <div className="button-row section-tight">
+        <button className="mini-btn" onClick={() => onReview(selectedRow, "approved")}>Approve</button>
+        <button className="mini-btn" onClick={() => onReview(selectedRow, "important")}>Mark important</button>
+        <button className="mini-btn" onClick={() => onReview(selectedRow, "needs-better-scrape")}>Needs better scrape</button>
+        <button className="mini-btn" onClick={() => onReview(selectedRow, "rejected")}>Reject</button>
+        <button className="mini-btn" onClick={() => onReview(selectedRow, "unreviewed")}>Clear review</button>
       </div>
 
       <div className="reader-title-card">
@@ -968,6 +1197,8 @@ function ArticleViewer({ rows, selectedIndex, selectedRow, onSelect }: { rows: R
         <Detail label="National outlet" value={<span className={boolValue(selectedRow.is_national_outlet) ? "pill good" : "pill info"}>{boolValue(selectedRow.is_national_outlet) ? "yes" : "no"}</span>} />
         <Detail label="Outlet country" value={normalizedCountry(selectedRow.outlet_country)} />
         <Detail label="Word count" value={String(selectedRow.word_count ?? "--")} />
+        <Detail label="Extraction score" value={String(selectedRow.extraction_score ?? "--")} />
+        <Detail label="Candidate count" value={String(selectedRow.candidate_count ?? "--")} />
         <Detail label="Duplicate group" value={String(selectedRow._archivelens_dedupe_group_size ?? 1)} />
       </div>
 
@@ -982,10 +1213,166 @@ function ArticleViewer({ rows, selectedIndex, selectedRow, onSelect }: { rows: R
         </div>
       </div>
 
+      <div className="reader-two-column section-tight">
+        <div className="reader-block">
+          <h4>Evidence links</h4>
+          {evidence.length ? evidence.map((item, index) => (
+            <div className="evidence-card" key={index}>
+              <strong>{String(item.claim || `Evidence ${index + 1}`)}</strong>
+              <blockquote>{String(item.quote || "No quote supplied.")}</blockquote>
+              <small>{String(item.relevance || "")}</small>
+            </div>
+          )) : <p>No evidence JSON available. Enable AI verification with v3 schema to populate evidence cards.</p>}
+        </div>
+        <div className="reader-block">
+          <h4>Winning extraction trace</h4>
+          <p><strong>{String(selectedRow.winning_candidate_route || selectedRow.recovery_route || "unknown")}</strong></p>
+          <p>{String(selectedRow.candidate_routes || "No candidate route trace available.")}</p>
+          <small>{trace.length} candidates evaluated.</small>
+        </div>
+      </div>
+
       <div className="reader-block section-tight">
         <h4>Recovered article text</h4>
         <pre className="article-text">{fullText || "No recovered article text available for this row."}</pre>
       </div>
+    </div>
+  );
+}
+
+function TracePanel({ rows }: { rows: RowRecord[] }) {
+  const [traceIndex, setTraceIndex] = useState(0);
+  if (!rows.length) return <div className="empty-state section-tight">No rows match the current filters.</div>;
+  const row = rows[Math.min(traceIndex, rows.length - 1)];
+  const trace = parseJsonArray<Record<string, unknown>>(row.extraction_trace_json);
+
+  return (
+    <div className="reader-console section-tight">
+      <div className="reader-toolbar">
+        <label className="field">
+          <FieldLabel label="Choose article trace" help="Shows every extraction candidate the scraper evaluated: JSON-LD, state payload, Readability, domain adapter, DOM, public reader, and archive candidates." />
+          <select value={traceIndex} onChange={(event) => setTraceIndex(Number(event.target.value))}>
+            {rows.slice(0, 1000).map((item, index) => <option key={index} value={index}>{index + 1}. {rowHeadline(item)}</option>)}
+          </select>
+        </label>
+        <span className={pillClass(row.extraction_confidence_label)}>{String(row.extraction_confidence_label || "unknown")}</span>
+      </div>
+      <div className="detail-grid">
+        <Detail label="Winner" value={String(row.winning_candidate_route || row.recovery_route || "unknown")} />
+        <Detail label="Candidates" value={String(row.candidate_count || trace.length || 0)} />
+        <Detail label="Extraction score" value={String(row.extraction_score || 0)} />
+        <Detail label="Boilerplate removed" value={`${Math.round(numberValue(row.boilerplate_ratio, 0) * 100)}%`} />
+      </div>
+      <div className="table-wrap section-tight">
+        <table>
+          <thead><tr><th>Selected</th><th>Route</th><th>Label</th><th>Score</th><th>Words</th><th>Status</th><th>Error</th></tr></thead>
+          <tbody>
+            {trace.map((attempt, index) => (
+              <tr key={index}>
+                <td>{attempt.selected ? <span className="pill good">winner</span> : ""}</td>
+                <td>{String(attempt.route || "")}</td>
+                <td><span className={pillClass(attempt.label)}>{String(attempt.label || "")}</span></td>
+                <td>{String(attempt.score ?? "")}</td>
+                <td>{String(attempt.words ?? "")}</td>
+                <td>{String(attempt.statusCode ?? "")}</td>
+                <td>{compact(attempt.error, 220)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DomainHealthPanel({ domainHealth }: { domainHealth: any[] }) {
+  if (!domainHealth.length) return <div className="empty-state section-tight">Domain health appears after a completed run.</div>;
+  return (
+    <div className="table-wrap section-tight">
+      <table>
+        <thead>
+          <tr><th>Domain</th><th>Rows</th><th>Full</th><th>Partial</th><th>Failed</th><th>Bot</th><th>Auth</th><th>429</th><th>Avg extraction</th><th>Avg quality</th><th>Avg align</th></tr>
+        </thead>
+        <tbody>
+          {domainHealth.map((domain) => (
+            <tr key={String(domain.domain)}>
+              <td>{String(domain.domain)}</td>
+              <td>{String(domain.rows)}</td>
+              <td>{String(domain.fullText)}</td>
+              <td>{String(domain.partial)}</td>
+              <td>{String(domain.failed)}</td>
+              <td>{String(domain.botBlocked)}</td>
+              <td>{String(domain.authRequired)}</td>
+              <td>{String(domain.rateLimited)}</td>
+              <td>{String(domain.averageExtractionScore)}</td>
+              <td>{String(domain.averageQualityScore)}</td>
+              <td>{String(domain.averageAlignmentScore)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ReviewQueue({ rows, reviewLabels, onReview }: { rows: RowRecord[]; reviewLabels: Record<string, ReviewStatus>; onReview: (row: RowRecord, status: ReviewStatus) => void }) {
+  if (!rows.length) return <div className="empty-state section-tight">No rows match the current filters.</div>;
+  const sorted = [...rows].sort((a, b) => {
+    const aNeeds = (reviewLabels[rowKey(a)] || "unreviewed") === "unreviewed" ? 0 : 1;
+    const bNeeds = (reviewLabels[rowKey(b)] || "unreviewed") === "unreviewed" ? 0 : 1;
+    return aNeeds - bNeeds || numberValue(a.summary_alignment_score, 0) - numberValue(b.summary_alignment_score, 0);
+  });
+  return (
+    <div className="table-wrap section-tight">
+      <table>
+        <thead><tr><th>Review</th><th>Headline</th><th>Recovery</th><th>Quality</th><th>Alignment</th><th>Actions</th></tr></thead>
+        <tbody>
+          {sorted.slice(0, 500).map((row, index) => {
+            const status = reviewLabels[rowKey(row)] || "unreviewed";
+            return (
+              <tr key={index}>
+                <td><span className={pillClass(status)}>{status}</span></td>
+                <td>{rowHeadline(row)}</td>
+                <td><span className={pillClass(row.quality_label)}>{String(row.quality_label || "")}</span></td>
+                <td>{String(row.quality_score ?? "--")}</td>
+                <td>{String(row.summary_alignment_score ?? "--")}</td>
+                <td className="action-cell">
+                  <button className="mini-btn" onClick={() => onReview(row, "approved")}>Approve</button>
+                  <button className="mini-btn" onClick={() => onReview(row, "important")}>Important</button>
+                  <button className="mini-btn" onClick={() => onReview(row, "needs-better-scrape")}>Better scrape</button>
+                  <button className="mini-btn" onClick={() => onReview(row, "rejected")}>Reject</button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RunHistoryPanel({ runHistory }: { runHistory: RunHistoryEntry[] }) {
+  if (!runHistory.length) return <div className="empty-state section-tight">Run history is saved in this browser after completed runs.</div>;
+  return (
+    <div className="table-wrap section-tight">
+      <table>
+        <thead><tr><th>Run</th><th>Created</th><th>Rows</th><th>Full text</th><th>Failed</th><th>Bot blocked</th><th>AI calls</th><th>Saved scrape requests</th><th>Elapsed</th></tr></thead>
+        <tbody>
+          {runHistory.map((entry) => (
+            <tr key={entry.runId}>
+              <td>{entry.runId}</td>
+              <td>{new Date(entry.createdAt).toLocaleString()}</td>
+              <td>{entry.rows.toLocaleString()}</td>
+              <td>{entry.fullTextRows.toLocaleString()}</td>
+              <td>{entry.failedRows.toLocaleString()}</td>
+              <td>{entry.botBlockedRows.toLocaleString()}</td>
+              <td>{entry.aiCalls.toLocaleString()}</td>
+              <td>{entry.duplicateRequestsSaved.toLocaleString()}</td>
+              <td>{(entry.elapsedMs / 1000).toFixed(1)}s</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

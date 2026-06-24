@@ -671,3 +671,36 @@ pre { white-space: pre-wrap; }
   .filter-head, .reader-toolbar { grid-template-columns: 1fr; display: grid; }
   .detail-grid { grid-template-columns: 1fr; }
 }
+
+/* ArchiveLens v3 additions */
+.evidence-card {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid rgba(34, 197, 94, 0.24);
+  border-radius: 16px;
+  background: rgba(34, 197, 94, 0.06);
+}
+.evidence-card strong {
+  color: #bbf7d0;
+}
+.evidence-card blockquote {
+  margin: 0;
+  padding-left: 12px;
+  border-left: 3px solid rgba(34, 197, 94, 0.45);
+  color: #e2e8f0;
+  line-height: 1.55;
+}
+.evidence-card small {
+  color: var(--muted);
+}
+.action-cell {
+  min-width: 360px;
+}
+.action-cell .mini-btn {
+  margin: 2px 4px 2px 0;
+}
+.table-wrap table td, .table-wrap table th {
+  vertical-align: top;
+}

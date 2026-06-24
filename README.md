@@ -1,63 +1,39 @@
-# ArchiveLens Vercel Console
+# ArchiveLens Vercel v3
 
-ArchiveLens is a Next.js/Vercel app for duplicate-aware article recovery, AI verification, prompt generation, and CSV/JSONL/DOCX export.
+ArchiveLens v3 is a Next.js/Vercel research console for duplicate-aware article recovery, extraction auditing, AI verification, filtering, review, and export.
 
-## What is new in this version
+## v3 upgrades
 
-- API Vault inside the interface for HUIT/OpenAI/Gemini
-- Provider-specific key fields for temporary/manual API connections
-- Environment-variable mode for Vercel deployment
-- API connection test button
-- Prompt Studio that turns your plain-language goal into a strong AI rubric or extraction prompt
-- Info buttons beside major controls so you know what each setting does
-- More polished dark command-center interface
-- Duplicate title grouping before scraping
-- Duplicate-aware AI reuse
-- In-site results console with searchable/filterable output table
-- Score threshold filters for quality and summary alignment
-- National-outlet and outlet-country filters, including US national news
-- Article viewer for full recovered text, AI summary, reasoning, URL, and metadata
-- Export filtered-only CSV, JSONL, and DOCX
+### Interface
 
-## Install on your computer
+- Dark command-center UI with API Vault, Prompt Studio, Launch panel, and Results Console.
+- Results tabs: Table, Article Viewer, Extraction Trace, Domain Health, Review Queue, Run History, Logs, and Guide.
+- Browser-persistent run history, saved filter views, prompt library, and review labels via `localStorage`.
+- Manual review actions: approve, important, needs better scrape, reject, clear review.
+- Filter by score thresholds, word count, national outlet, country, recovery label, AI status, duplicate groups, and manual review label.
+- Export full or filtered CSV, JSONL, DOCX, plus an audit JSON package.
 
-Install Node.js, then install the project packages:
+### Scraper
+
+- Multi-candidate extraction engine instead of single-route extraction.
+- Candidate sources include JSON-LD, Next/Nuxt/app state payloads, domain-specific adapters, Mozilla Readability, DOM scoring, Jina Reader, and Wayback snapshots.
+- Extraction traces are saved per row as `extraction_trace_json`.
+- New diagnostics: candidate count, winning route, candidate routes, extraction score, confidence label, boilerplate ratio, duplicate paragraph ratio.
+- Domain health table grouped by hostname.
+- In-memory URL cache for warm Vercel functions.
+- Robots-aware public scraping, 429 backoff, authorized-cookie support, bot/auth/rate-limit labels.
+
+### AI
+
+- Evidence-linked AI output with `evidence_json`.
+- Split scores: extraction completeness, article relevance, source reliability, summary alignment, national-outlet confidence, outlet-country confidence.
+- Prompt Studio can generate rubrics and save them to a local prompt library.
+
+## Install locally
 
 ```bash
-cd archivelens_vercel_next
+cd ~/Downloads/archivelens_vercel_next
 npm install
-```
-
-The project dependencies are listed in `package.json`. The main runtime packages are:
-
-```bash
-npm install next react react-dom papaparse cheerio robots-parser p-limit openai @google/generative-ai docx zod
-npm install -D typescript @types/node @types/react @types/react-dom @types/papaparse
-```
-
-## Local environment variables
-
-Create `.env.local`:
-
-```bash
-cp .env.example .env.local
-```
-
-Then add any keys you want to use:
-
-```bash
-HUIT_OPENAI_API_KEY=
-OPENAI_API_KEY=
-GEMINI_API_KEY=
-HUIT_OPENAI_BASE_URL=https://go.apis.huit.harvard.edu/ais-openai-direct-limited-schools/v1
-ARCHIVELENS_CONTACT_EMAIL=your-email@example.edu
-```
-
-You can also skip `.env.local` and use the in-app API Vault in manual/session-key mode.
-
-## Run locally
-
-```bash
 npm run dev
 ```
 
@@ -67,85 +43,57 @@ Open:
 http://localhost:3000
 ```
 
-## API Vault workflow
+## Required packages
 
-Inside the app:
-
-1. Open the API Vault panel.
-2. Choose `Use .env / Vercel` or `Paste keys here`.
-3. Pick HUIT, OpenAI, or Gemini.
-4. Choose a model.
-5. Click the test button.
-6. Enable AI verification when ready.
-
-Manual keys are sent only with the current request. Environment mode uses `.env.local` locally and Vercel project environment variables after deployment.
-
-## Prompt Studio workflow
-
-1. Type what you want the AI to evaluate.
-2. Pick a prompt type, strictness, and audience.
-3. Add anything the prompt must include or avoid.
-4. Click `Generate prompt`.
-5. Click `Use as AI rubric` to insert it into the verification pipeline.
-
-Prompt Studio can use your connected AI provider. If no API key is available, it falls back to a local template generator.
-
-
-## Results console workflow
-
-After running the pipeline, open the Results Console inside the website. It includes:
-
-- Search across headline, URL, country, status, AI reasoning, executive summary, and recovered text
-- Minimum `quality_score` filter
-- Minimum `summary_alignment_score` filter
-- Minimum word-count filter
-- National-outlet filter: any, national only, or non-national/local/unknown
-- Outlet-country filter, including `United States`
-- Recovery-label filter such as `full_text`, `partial_text`, `bot_blocked`, or `auth_required`
-- AI-status filter such as `VERIFIED_PASSED` or `NEEDS_MANUAL_REVIEW`
-- Duplicate-group-only toggle
-- Sort controls for quality, alignment, word count, headline, and country
-
-Use the `US national news` preset to combine national-outlet filtering with `United States` outlet country. These fields come from AI verification, so enable AI if you want the national/country filters to be accurate.
-
-The Article Viewer tab lets you read the selected result inside the website, including recovered article text, AI executive summary, AI reasoning, score fields, recovery label, source URL, outlet country, and duplicate-group size.
-
-Filtered exports are available directly inside the Results Console as filtered CSV, filtered JSONL, and filtered DOCX.
-
-## Deploy to Vercel
+The project installs these from `package.json`:
 
 ```bash
-npm install -g vercel
-vercel login
-vercel
+npm install next react react-dom papaparse cheerio robots-parser p-limit openai @google/generative-ai docx zod @mozilla/readability jsdom
+npm install -D typescript @types/node @types/react @types/react-dom @types/papaparse @types/jsdom
+```
+
+## Environment variables
+
+Create `.env.local` for local development:
+
+```bash
+HUIT_OPENAI_API_KEY=
+OPENAI_API_KEY=
+GEMINI_API_KEY=
+HUIT_OPENAI_BASE_URL=https://go.apis.huit.harvard.edu/ais-openai-direct-limited-schools/v1
+ARCHIVELENS_CONTACT_EMAIL=your-email@example.edu
+```
+
+For production, add the same variables in Vercel Project Settings → Environment Variables.
+
+## Deploy
+
+```bash
+npm run build
 vercel --prod
 ```
 
-Add the same environment variables in the Vercel dashboard under Project Settings.
+With GitHub connected to Vercel, future updates are:
 
-## Fast settings
-
-For speed:
-
-```text
-Group duplicate articles before scraping: title/headline column
-Recovery route: Fast: live + reader only
-Performance profile: Fast duplicate-aware
-Concurrency: 6-8
-Retries: 2
-Timeout: 12 seconds
-Use public reader fallback: on
-Use Wayback fallback: off
-Reuse duplicate AI: on
+```bash
+git add .
+git commit -m "Update ArchiveLens"
+git push
 ```
 
-For maximum recovery:
+Vercel will auto-deploy the production branch.
 
-```text
-Recovery route: Balanced or Archive first
-Performance profile: Maximum recovery
-Use public reader fallback: on
-Use Wayback fallback: on
-Retries: 4+
-Timeout: 20+ seconds
-```
+## Important limitations
+
+This v3 implementation keeps run history, saved views, review labels, and prompt library in the browser with `localStorage`. That means they are fast and simple but not shared across browsers/devices.
+
+For a true multi-user research platform, the next step is adding Vercel Postgres/Supabase for persistent projects and Vercel Queues/Workflows for durable background processing of very large CSV files.
+
+## Safety note
+
+ArchiveLens does not impersonate Googlebot, falsify IP headers, or bypass access controls. It can use authorized cookies you provide for content you are allowed to access, and otherwise labels bot blocks, login walls, paywalls, robots restrictions, and rate limits transparently.
+
+
+## v3.1 crash-resistance patch
+
+This build validates API base URLs before creating provider clients. If you see `The string did not match the expected pattern`, clear the HUIT/OpenAI base URL fields and use the default HUIT endpoint: `https://go.apis.huit.harvard.edu/ais-openai-direct-limited-schools/v1`. API keys belong in key fields or Vercel environment variables, not in base URL fields.

@@ -1,8 +1,13 @@
 import * as cheerio from "cheerio";
+import { JSDOM } from "jsdom";
+import { Readability } from "@mozilla/readability";
 import robotsParser from "robots-parser";
-import type { ProcessOptions, RowRecord, ScrapeResult } from "@/types/archivelens";
+import { domainAdapterCandidates } from "@/lib/domain-adapters";
+import type { ExtractionAttempt, ProcessOptions, RowRecord, ScrapeResult } from "@/types/archivelens";
 
 const DEFAULT_USER_AGENT = "ArchiveLensResearchBot/3.0 (+https://example.edu/archivelens; research-use)";
+const CACHE_TTL_MS = 1000 * 60 * 60 * 24;
+const MEMORY_CACHE = new Map<string, { expiresAt: number; result: ScrapeResult }>();
 
 const JUNK_PHRASES = [
   "verify you are human",
@@ -30,7 +35,8 @@ const AUTH_PHRASES = [
   "members-only",
   "this content is for subscribers",
   "you have reached your article limit",
-  "metered paywall"
+  "metered paywall",
+  "support our journalism"
 ];
 
 const BOT_BLOCK_PHRASES = [
@@ -43,7 +49,9 @@ const BOT_BLOCK_PHRASES = [
   "access denied",
   "forbidden for bots",
   "your request has been blocked",
-  "temporarily blocked"
+  "temporarily blocked",
+  "why did this happen",
+  "we have detected unusual activity"
 ];
 
 const BOILERPLATE_SELECTORS = [
@@ -81,6 +89,24 @@ const BOILERPLATE_SELECTORS = [
   ".cookie"
 ];
 
+type ArticleMetadata = {
+  title: string;
+  author: string;
+  date: string;
+  siteName: string;
+  canonicalUrl: string;
+};
+
+type TextMetrics = {
+  chars: number;
+  words: number;
+  paragraphs: number;
+  sentences: number;
+  junkHits: number;
+  authHits: number;
+  botHits: number;
+};
+
 type Candidate = {
   text: string;
   route: string;
@@ -89,14 +115,9 @@ type Candidate = {
   metadata: ArticleMetadata;
   score: number;
   error: string;
-};
-
-type ArticleMetadata = {
-  title: string;
-  author: string;
-  date: string;
-  siteName: string;
-  canonicalUrl: string;
+  metrics: TextMetrics;
+  boilerplateRatio: number;
+  duplicateParagraphRatio: number;
 };
 
 type FetchOutcome = {
@@ -136,6 +157,26 @@ function normalizeUrl(input: string): string {
   }
 }
 
+function cacheKey(url: string, options: ProcessOptions): string {
+  return [url, options.recoveryRoute, options.performanceProfile, options.minChars, options.useJina, options.useWayback, options.respectRobots].join("|");
+}
+
+function getCached(url: string, options: ProcessOptions): ScrapeResult | null {
+  if (options.authorizedCookie?.trim()) return null;
+  const cached = MEMORY_CACHE.get(cacheKey(url, options));
+  if (!cached) return null;
+  if (cached.expiresAt < Date.now()) {
+    MEMORY_CACHE.delete(cacheKey(url, options));
+    return null;
+  }
+  return { ...cached.result, from_cache: true } as ScrapeResult;
+}
+
+function setCached(url: string, options: ProcessOptions, result: ScrapeResult): void {
+  if (options.authorizedCookie?.trim()) return;
+  MEMORY_CACHE.set(cacheKey(url, options), { expiresAt: Date.now() + CACHE_TTL_MS, result });
+}
+
 function requestHeaders(options: ProcessOptions): HeadersInit {
   const headers: Record<string, string> = {
     "User-Agent": DEFAULT_USER_AGENT,
@@ -147,10 +188,7 @@ function requestHeaders(options: ProcessOptions): HeadersInit {
   const contact = process.env.ARCHIVELENS_CONTACT_EMAIL;
   if (contact) headers.From = contact;
 
-  if (options.authorizedCookie?.trim()) {
-    headers.Cookie = options.authorizedCookie.trim().replace(/[\r\n]/g, "");
-  }
-
+  if (options.authorizedCookie?.trim()) headers.Cookie = options.authorizedCookie.trim().replace(/[\r\n]/g, "");
   return headers;
 }
 
@@ -164,6 +202,11 @@ function parseRetryAfter(value: string | null): number | null {
 }
 
 async function fetchWithRetries(url: string, options: ProcessOptions, route: string): Promise<FetchOutcome> {
+  const safeUrl = normalizeUrl(url);
+  if (!safeUrl) {
+    return { ok: false, status: 0, url, text: "", error: `Invalid URL for ${route}: ${String(url).slice(0, 180)}` };
+  }
+  url = safeUrl;
   let lastError = "";
   let lastStatus = 0;
   const attempts = Math.max(1, options.retries);
@@ -210,29 +253,21 @@ async function fetchWithRetries(url: string, options: ProcessOptions, route: str
 
 async function robotsAllowed(url: string, options: ProcessOptions): Promise<{ allowed: boolean; note: string }> {
   if (!options.respectRobots) return { allowed: true, note: "robots.txt check disabled by user setting." };
-
   try {
     const parsed = new URL(url);
     const robotsUrl = `${parsed.protocol}//${parsed.host}/robots.txt`;
-    const response = await fetch(robotsUrl, {
-      headers: requestHeaders(options),
-      signal: AbortSignal.timeout(Math.min(options.timeoutMs, 8_000))
-    });
-
+    const response = await fetch(robotsUrl, { headers: requestHeaders(options), signal: AbortSignal.timeout(Math.min(options.timeoutMs, 8_000)) });
     if (!response.ok) return { allowed: true, note: "robots.txt unavailable; proceeded conservatively." };
-
     const robotsText = await response.text();
     const parser = robotsParser(robotsUrl, robotsText);
     const allowed = parser.isAllowed(url, DEFAULT_USER_AGENT);
-    return allowed === false
-      ? { allowed: false, note: "Blocked by robots.txt for ArchiveLensResearchBot." }
-      : { allowed: true, note: "robots.txt allowed." };
+    return allowed === false ? { allowed: false, note: "Blocked by robots.txt for ArchiveLensResearchBot." } : { allowed: true, note: "robots.txt allowed." };
   } catch {
     return { allowed: true, note: "robots.txt check failed; proceeded conservatively." };
   }
 }
 
-function contentMetrics(text: string): { chars: number; words: number; paragraphs: number; sentences: number; junkHits: number; authHits: number; botHits: number } {
+function contentMetrics(text: string): TextMetrics {
   const clean = collapseWhitespace(text);
   const lower = clean.toLowerCase();
   return {
@@ -246,39 +281,54 @@ function contentMetrics(text: string): { chars: number; words: number; paragraph
   };
 }
 
+function duplicateParagraphRatio(text: string): number {
+  const paragraphs = collapseWhitespace(text).split(/\n\s*\n/).map((p) => p.toLowerCase().replace(/\W+/g, "").slice(0, 260)).filter((p) => p.length > 60);
+  if (!paragraphs.length) return 0;
+  const seen = new Set<string>();
+  let dupes = 0;
+  for (const p of paragraphs) {
+    if (seen.has(p)) dupes += 1;
+    seen.add(p);
+  }
+  return Math.round((dupes / paragraphs.length) * 1000) / 1000;
+}
+
 function scoreTextQuality(text: string, minChars: number): number {
   const m = contentMetrics(text);
   if (!m.chars) return 0;
-
   let score = 0;
   score += Math.min(45, m.chars / 120);
   score += Math.min(25, m.words / 35);
   score += Math.min(20, m.paragraphs * 2.5);
   score += Math.min(10, m.sentences / 4);
-
   if (m.chars < minChars) score -= 35;
   if (m.paragraphs < 2) score -= 15;
   if (m.authHits) score -= 45;
   if (m.botHits) score -= 60;
   if (m.junkHits) score -= Math.min(30, m.junkHits * 8);
-
+  score -= duplicateParagraphRatio(text) * 20;
   return Math.max(0, Math.min(100, Math.round(score * 10) / 10));
 }
 
 function classifyQuality(text: string, minChars: number, statusCode: number | string): { label: string; error: string } {
   const metrics = contentMetrics(text);
-
-  if (statusCode === 429) return { label: "rate_limited", error: "HTTP 429 received. Reduce concurrency or retry later." };
+  if (Number(statusCode) === 429) return { label: "rate_limited", error: "HTTP 429 received. Reduce concurrency or retry later." };
   if ([401, 403].includes(Number(statusCode))) return { label: "auth_required", error: "Server requires authorization, login, or access permission." };
   if (metrics.botHits > 0) return { label: "bot_blocked", error: "The recovered page says automated/bot access is blocked." };
   if (metrics.authHits > 0) return { label: "auth_required", error: "Recovered page appears to be a login/subscription/access-control screen." };
   if (metrics.chars === 0) return { label: "failed", error: "No extractable text found." };
   if (metrics.chars < minChars || metrics.words < 80) return { label: "partial_text", error: "Only a short fragment was recovered." };
-
   const score = scoreTextQuality(text, minChars);
   if (score >= 68) return { label: "full_text", error: "" };
   if (score >= 42) return { label: "partial_text", error: "Recovered text may be incomplete or noisy." };
   return { label: "low_confidence", error: "Recovered text quality is low; verify manually." };
+}
+
+function confidenceLabel(score: number, label: string): string {
+  if (label === "full_text" && score >= 85) return "high";
+  if (label === "full_text" || score >= 68) return "medium";
+  if (["partial_text", "low_confidence"].includes(label)) return "low";
+  return "blocked_or_failed";
 }
 
 function metaContent($: cheerio.CheerioAPI, ...names: string[]): string {
@@ -295,14 +345,7 @@ function extractMetadata($: cheerio.CheerioAPI): ArticleMetadata {
   const date = metaContent($, "article:published_time", "date", "pubdate", "publish-date", "parsely-pub-date");
   const siteName = metaContent($, "og:site_name", "application-name");
   const canonicalUrl = $("link[rel='canonical']").first().attr("href") ?? "";
-
-  return {
-    title: sanitizeText(title),
-    author: sanitizeText(author),
-    date: sanitizeText(date),
-    siteName: sanitizeText(siteName),
-    canonicalUrl: sanitizeText(canonicalUrl)
-  };
+  return { title: sanitizeText(title), author: sanitizeText(author), date: sanitizeText(date), siteName: sanitizeText(siteName), canonicalUrl: sanitizeText(canonicalUrl) };
 }
 
 function authorToText(value: unknown): string {
@@ -322,9 +365,7 @@ function walkJson(value: unknown, onString: (text: string, keyHint: string) => v
     return;
   }
   if (value && typeof value === "object") {
-    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-      walkJson(child, onString, key.toLowerCase());
-    }
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) walkJson(child, onString, key.toLowerCase());
     return;
   }
   if (typeof value === "string") onString(value, keyHint);
@@ -333,13 +374,11 @@ function walkJson(value: unknown, onString: (text: string, keyHint: string) => v
 function extractJsonLd($: cheerio.CheerioAPI): { texts: string[]; metadata: Partial<ArticleMetadata> } {
   const texts: string[] = [];
   const metadata: Partial<ArticleMetadata> = {};
-
   $("script[type*='ld+json']").each((_, element) => {
     const raw = $(element).html() ?? "";
     try {
       const parsed = JSON.parse(raw.trim());
-      const objects = Array.isArray(parsed) ? parsed : [parsed];
-      const stack = [...objects];
+      const stack = Array.isArray(parsed) ? [...parsed] : [parsed];
       while (stack.length) {
         const obj = stack.pop();
         if (!obj || typeof obj !== "object") continue;
@@ -357,32 +396,22 @@ function extractJsonLd($: cheerio.CheerioAPI): { texts: string[]; metadata: Part
         if (!metadata.date && (record.datePublished || record.dateModified)) metadata.date = collapseWhitespace(record.datePublished ?? record.dateModified);
       }
     } catch {
-      // Ignore malformed JSON-LD blocks.
+      // Ignore malformed JSON-LD.
     }
   });
-
   return { texts: dedupeBlocks(texts), metadata };
 }
 
 function extractStatePayloadText($: cheerio.CheerioAPI): string[] {
   const candidates: string[] = [];
   const articleKeys = new Set(["articlebody", "body", "content", "contenttext", "text", "storybody", "maintext", "description", "dek", "summary"]);
-
   $("script").each((_, element) => {
     const raw = $(element).html() ?? "";
     const id = String($(element).attr("id") ?? "").toLowerCase();
     const type = String($(element).attr("type") ?? "").toLowerCase();
     const header = raw.slice(0, 900).toLowerCase();
-    const likelyState =
-      id === "__next_data__" ||
-      id.includes("nuxt") ||
-      type.includes("application/json") ||
-      header.includes("__initial_state__") ||
-      header.includes("__preloaded_state__") ||
-      raw.toLowerCase().includes("articlebody");
-
+    const likelyState = id === "__next_data__" || id.includes("nuxt") || type.includes("application/json") || header.includes("__initial_state__") || header.includes("__preloaded_state__") || raw.toLowerCase().includes("articlebody");
     if (!likelyState || raw.length > 2_500_000) return;
-
     let parsed: unknown = null;
     try {
       parsed = JSON.parse(raw.trim());
@@ -396,15 +425,12 @@ function extractStatePayloadText($: cheerio.CheerioAPI): string[] {
         }
       }
     }
-
     if (parsed) {
       walkJson(parsed, (value, keyHint) => {
         const clean = collapseWhitespace(value.replace(/\\n/g, "\n").replace(/\\t/g, " "));
         const words = clean.split(/\s+/).length;
         const punctuation = (clean.match(/[.!?]/g) ?? []).length;
-        if (clean.length > 220 && words >= 45 && punctuation >= 2 && (articleKeys.has(keyHint) || words >= 80)) {
-          candidates.push(clean);
-        }
+        if (clean.length > 220 && words >= 45 && punctuation >= 2 && (articleKeys.has(keyHint) || words >= 80)) candidates.push(clean);
       });
     } else {
       const matches = raw.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"/g);
@@ -414,7 +440,6 @@ function extractStatePayloadText($: cheerio.CheerioAPI): string[] {
       }
     }
   });
-
   return dedupeBlocks(candidates).sort((a, b) => scoreTextQuality(b, 300) - scoreTextQuality(a, 300)).slice(0, 8);
 }
 
@@ -432,26 +457,28 @@ function dedupeBlocks(blocks: string[]): string[] {
   return out;
 }
 
-function removeBoilerplate($: cheerio.CheerioAPI): void {
+function removeBoilerplate($: cheerio.CheerioAPI): number {
+  const before = collapseWhitespace($.text()).length;
   for (const selector of BOILERPLATE_SELECTORS) $(selector).remove();
+  const after = collapseWhitespace($.text()).length;
+  if (!before) return 0;
+  return Math.max(0, Math.min(1, Math.round(((before - after) / before) * 1000) / 1000));
 }
 
 function nodeToMarkdown($: cheerio.CheerioAPI, node: any): string {
   const blocks: string[] = [];
-  $(node)
-    .find("h1,h2,h3,h4,p,li,blockquote")
-    .each((_, element) => {
-      const text = collapseWhitespace($(element).text());
-      if (!text || text.split(/\s+/).length < 3) return;
-      const tag = element.tagName.toLowerCase();
-      if (tag === "h1") blocks.push(`# ${text}`);
-      else if (tag === "h2") blocks.push(`## ${text}`);
-      else if (tag === "h3") blocks.push(`### ${text}`);
-      else if (tag === "h4") blocks.push(`#### ${text}`);
-      else if (tag === "li") blocks.push(`- ${text}`);
-      else if (tag === "blockquote") blocks.push(`> ${text}`);
-      else blocks.push(text);
-    });
+  $(node).find("h1,h2,h3,h4,p,li,blockquote").each((_, element) => {
+    const text = collapseWhitespace($(element).text());
+    if (!text || text.split(/\s+/).length < 3) return;
+    const tag = element.tagName.toLowerCase();
+    if (tag === "h1") blocks.push(`# ${text}`);
+    else if (tag === "h2") blocks.push(`## ${text}`);
+    else if (tag === "h3") blocks.push(`### ${text}`);
+    else if (tag === "h4") blocks.push(`#### ${text}`);
+    else if (tag === "li") blocks.push(`- ${text}`);
+    else if (tag === "blockquote") blocks.push(`> ${text}`);
+    else blocks.push(text);
+  });
   return dedupeBlocks(blocks).join("\n\n");
 }
 
@@ -459,31 +486,16 @@ function linkDensity($: cheerio.CheerioAPI, node: any): number {
   const totalTextLength = collapseWhitespace($(node).text()).length;
   if (!totalTextLength) return 1;
   let linkTextLength = 0;
-  $(node)
-    .find("a")
-    .each((_, anchor) => {
-      linkTextLength += collapseWhitespace($(anchor).text()).length;
-    });
+  $(node).find("a").each((_, anchor) => {
+    linkTextLength += collapseWhitespace($(anchor).text()).length;
+  });
   return Math.min(1, linkTextLength / totalTextLength);
 }
 
 function domCandidates($: cheerio.CheerioAPI, minChars: number): Array<{ text: string; route: string; score: number }> {
-  const selectors = [
-    "article",
-    "main",
-    "[role='main']",
-    "[itemprop='articleBody']",
-    "[data-testid*='article']",
-    "[class*='article']",
-    "[class*='story']",
-    "[class*='post-content']",
-    "[class*='entry-content']",
-    "[class*='body']"
-  ];
-
+  const selectors = ["article", "main", "[role='main']", "[itemprop='articleBody']", "[data-testid*='article']", "[class*='article']", "[class*='story']", "[class*='post-content']", "[class*='entry-content']", "[class*='body']"];
   const nodes: any[] = [];
   const seen = new Set<any>();
-
   for (const selector of selectors) {
     $(selector).each((_, element) => {
       if (!seen.has(element)) {
@@ -492,79 +504,114 @@ function domCandidates($: cheerio.CheerioAPI, minChars: number): Array<{ text: s
       }
     });
   }
-
   if (!nodes.length && $("body").get(0)) nodes.push($("body").get(0)!);
-
-  return nodes
-    .map((node) => {
-      const text = nodeToMarkdown($, node);
-      const className = String($(node).attr("class") ?? "").toLowerCase();
-      const id = String($(node).attr("id") ?? "").toLowerCase();
-      let score = scoreTextQuality(text, minChars);
-      if (/(article|story|content|body|post|entry)/i.test(`${className} ${id}`)) score += 8;
-      score -= linkDensity($, node) * 30;
-      return { text, route: "dom", score };
-    })
-    .filter((item) => item.text)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 8);
+  return nodes.map((node) => {
+    const text = nodeToMarkdown($, node);
+    const className = String($(node).attr("class") ?? "").toLowerCase();
+    const id = String($(node).attr("id") ?? "").toLowerCase();
+    let score = scoreTextQuality(text, minChars);
+    if (/(article|story|content|body|post|entry)/i.test(`${className} ${id}`)) score += 8;
+    score -= linkDensity($, node) * 30;
+    return { text, route: "dom", score };
+  }).filter((item) => item.text).sort((a, b) => b.score - a.score).slice(0, 8);
 }
 
-function extractSemanticContent(html: string, sourceUrl: string, minChars: number): Candidate {
+function readabilityCandidate(html: string, sourceUrl: string, minChars: number): Array<{ text: string; route: string; score: number }> {
+  try {
+    const dom = new JSDOM(html, { url: sourceUrl });
+    const article = new Readability(dom.window.document).parse();
+    const text = collapseWhitespace(article?.textContent ?? "");
+    if (!text || text.length < 120) return [];
+    return [{ text, route: "readability", score: scoreTextQuality(text, minChars) + 3 }];
+  } catch {
+    return [];
+  }
+}
+
+function emptyMetadata(): ArticleMetadata {
+  return { title: "", author: "", date: "", siteName: "", canonicalUrl: "" };
+}
+
+function makeCandidate(args: {
+  text: string;
+  route: string;
+  sourceUrl: string;
+  statusCode: number | string;
+  metadata?: Partial<ArticleMetadata>;
+  baseMetadata?: ArticleMetadata;
+  score?: number;
+  error?: string;
+  boilerplateRatio?: number;
+}): Candidate {
+  const text = collapseWhitespace(args.text);
+  const metadata = { ...(args.baseMetadata ?? emptyMetadata()), ...(args.metadata ?? {}) };
+  const metrics = contentMetrics(text);
+  return {
+    text,
+    route: args.route,
+    sourceUrl: args.sourceUrl,
+    statusCode: args.statusCode,
+    metadata,
+    score: args.score ?? scoreTextQuality(text, 300),
+    error: args.error ?? "",
+    metrics,
+    boilerplateRatio: args.boilerplateRatio ?? 0,
+    duplicateParagraphRatio: duplicateParagraphRatio(text)
+  };
+}
+
+function extractSemanticCandidates(html: string, sourceUrl: string, minChars: number, routePrefix: string, statusCode: number | string): Candidate[] {
   const $ = cheerio.load(html);
   const baseMetadata = extractMetadata($);
-  const candidates: Array<{ text: string; route: string; score: number; metadata?: Partial<ArticleMetadata> }> = [];
+  const candidates: Candidate[] = [];
 
   const jsonLd = extractJsonLd($);
-  for (const text of jsonLd.texts) candidates.push({ text, route: "json_ld", score: scoreTextQuality(text, minChars), metadata: jsonLd.metadata });
+  for (const text of jsonLd.texts) {
+    candidates.push(makeCandidate({ text, route: `${routePrefix}:json_ld`, sourceUrl, statusCode, baseMetadata, metadata: jsonLd.metadata, score: scoreTextQuality(text, minChars) + 5 }));
+  }
 
   const stateTexts = extractStatePayloadText($);
   if (stateTexts.length) {
     const joined = stateTexts.slice(0, 4).join("\n\n");
-    candidates.push({ text: joined, route: "state_payload", score: scoreTextQuality(joined, minChars) + 4 });
+    candidates.push(makeCandidate({ text: joined, route: `${routePrefix}:state_payload`, sourceUrl, statusCode, baseMetadata, score: scoreTextQuality(joined, minChars) + 4 }));
   }
 
-  removeBoilerplate($);
-  candidates.push(...domCandidates($, minChars));
+  for (const adapter of domainAdapterCandidates(html, sourceUrl)) {
+    candidates.push(makeCandidate({ text: adapter.text, route: `${routePrefix}:${adapter.route}`, sourceUrl, statusCode, baseMetadata, metadata: { title: adapter.title, author: adapter.author }, score: scoreTextQuality(adapter.text, minChars) + 6 }));
+  }
+
+  for (const readability of readabilityCandidate(html, sourceUrl, minChars)) {
+    candidates.push(makeCandidate({ text: readability.text, route: `${routePrefix}:${readability.route}`, sourceUrl, statusCode, baseMetadata, score: readability.score }));
+  }
+
+  const pruned = cheerio.load(html);
+  const boilerplateRatio = removeBoilerplate(pruned);
+  for (const dom of domCandidates(pruned, minChars)) {
+    candidates.push(makeCandidate({ text: dom.text, route: `${routePrefix}:${dom.route}`, sourceUrl, statusCode, baseMetadata, score: dom.score, boilerplateRatio }));
+  }
 
   if (!candidates.length) {
-    const fallback = collapseWhitespace($("body").text() || $.text());
-    candidates.push({ text: fallback, route: "fallback_text", score: scoreTextQuality(fallback, minChars) });
+    const fallback = collapseWhitespace(pruned("body").text() || pruned.text());
+    candidates.push(makeCandidate({ text: fallback, route: `${routePrefix}:fallback_text`, sourceUrl, statusCode, baseMetadata, score: scoreTextQuality(fallback, minChars), boilerplateRatio }));
   }
 
-  const best = candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)[0];
-  const metadata = { ...baseMetadata, ...(best.metadata ?? {}) };
-
-  return {
-    text: collapseWhitespace(best.text),
-    route: best.route,
-    sourceUrl,
-    statusCode: "",
-    metadata,
-    score: scoreTextQuality(best.text, minChars),
-    error: ""
-  };
+  return candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length).slice(0, 12);
 }
 
-async function executeLive(url: string, options: ProcessOptions): Promise<Candidate> {
+async function executeLive(url: string, options: ProcessOptions): Promise<Candidate[]> {
   const fetched = await fetchWithRetries(url, options, "live");
-  if (!fetched.text) {
-    return { text: "", route: "live", sourceUrl: fetched.url, statusCode: fetched.status, metadata: emptyMetadata(), score: 0, error: fetched.error };
-  }
-  const candidate = extractSemanticContent(fetched.text, fetched.url, options.minChars);
-  return { ...candidate, route: `live:${candidate.route}`, statusCode: fetched.status, error: fetched.error };
+  if (!fetched.text) return [makeCandidate({ text: "", route: "live", sourceUrl: fetched.url, statusCode: fetched.status, error: fetched.error })];
+  const candidates = extractSemanticCandidates(fetched.text, fetched.url, options.minChars, "live", fetched.status);
+  if (fetched.error) candidates.forEach((candidate) => { candidate.error = fetched.error; });
+  return candidates;
 }
 
-async function executeJina(url: string, options: ProcessOptions): Promise<Candidate> {
+async function executeJina(url: string, options: ProcessOptions): Promise<Candidate[]> {
   const readerUrl = `https://r.jina.ai/${url}`;
   const fetched = await fetchWithRetries(readerUrl, { ...options, authorizedCookie: "" }, "jina_reader");
-  if (!fetched.text) {
-    return { text: "", route: "jina_reader", sourceUrl: readerUrl, statusCode: fetched.status, metadata: emptyMetadata(), score: 0, error: fetched.error };
-  }
-
+  if (!fetched.text) return [makeCandidate({ text: "", route: "jina_reader", sourceUrl: readerUrl, statusCode: fetched.status, error: fetched.error })];
   let text = fetched.text;
-  const contentTypeJson = /^\s*\{/.test(text);
-  if (contentTypeJson) {
+  if (/^\s*\{/.test(text)) {
     try {
       const data = JSON.parse(text) as { data?: { content?: string }; content?: string };
       text = data.data?.content ?? data.content ?? text;
@@ -572,165 +619,124 @@ async function executeJina(url: string, options: ProcessOptions): Promise<Candid
       // Keep raw text.
     }
   }
-
-  text = collapseWhitespace(text);
-  return {
-    text,
-    route: "jina_reader",
-    sourceUrl: readerUrl,
-    statusCode: fetched.status,
-    metadata: emptyMetadata(),
-    score: scoreTextQuality(text, options.minChars),
-    error: fetched.error
-  };
+  return [makeCandidate({ text, route: "jina_reader", sourceUrl: readerUrl, statusCode: fetched.status, score: scoreTextQuality(text, options.minChars), error: fetched.error })];
 }
 
-async function executeWayback(url: string, options: ProcessOptions): Promise<Candidate> {
-  const cdxParams = new URLSearchParams({
-    url,
-    output: "json",
-    collapse: "digest",
-    fl: "timestamp,original,statuscode,mimetype,digest",
-    limit: "8"
-  });
+async function executeWayback(url: string, options: ProcessOptions): Promise<Candidate[]> {
+  const cdxParams = new URLSearchParams({ url, output: "json", collapse: "digest", fl: "timestamp,original,statuscode,mimetype,digest", limit: "8" });
   cdxParams.append("filter", "statuscode:200");
   cdxParams.append("filter", "mimetype:text/html");
-
   const cdxUrl = `https://web.archive.org/cdx/search/cdx?${cdxParams.toString()}`;
   const fetched = await fetchWithRetries(cdxUrl, { ...options, authorizedCookie: "" }, "wayback_cdx");
-  if (!fetched.ok || !fetched.text) {
-    return { text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: fetched.status, metadata: emptyMetadata(), score: 0, error: fetched.error || "No Wayback CDX response." };
-  }
-
+  if (!fetched.ok || !fetched.text) return [makeCandidate({ text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: fetched.status, error: fetched.error || "No Wayback CDX response." })];
   let rows: string[][] = [];
   try {
     rows = JSON.parse(fetched.text) as string[][];
   } catch {
-    return { text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: fetched.status, metadata: emptyMetadata(), score: 0, error: "Wayback CDX parse failed." };
+    return [makeCandidate({ text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: fetched.status, error: "Wayback CDX parse failed." })];
   }
+  if (!Array.isArray(rows) || rows.length <= 1) return [makeCandidate({ text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: 200, error: "No public Wayback HTML snapshots found." })];
 
-  if (!Array.isArray(rows) || rows.length <= 1) {
-    return { text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: 200, metadata: emptyMetadata(), score: 0, error: "No public Wayback HTML snapshots found." };
-  }
-
-  let best: Candidate = { text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: 200, metadata: emptyMetadata(), score: 0, error: "No usable Wayback text found." };
-
-  const snapshotRows = rows.slice(1).reverse();
-  for (const row of snapshotRows) {
+  const candidates: Candidate[] = [];
+  for (const row of rows.slice(1).reverse()) {
     const [timestamp, original] = row;
     if (!timestamp || !original) continue;
     const snapshotUrl = `https://web.archive.org/web/${timestamp}id_/${original}`;
     const snap = await fetchWithRetries(snapshotUrl, { ...options, authorizedCookie: "" }, "wayback_snapshot");
     if (!snap.text) continue;
-    const candidate = extractSemanticContent(snap.text, snapshotUrl, options.minChars);
-    const scored = { ...candidate, route: `wayback:${candidate.route}`, statusCode: snap.status, error: snap.error };
-    if (scored.score > best.score) best = scored;
-    if (scored.score >= 68) break;
+    const snapshotCandidates = extractSemanticCandidates(snap.text, snapshotUrl, options.minChars, "wayback", snap.status);
+    snapshotCandidates.forEach((candidate) => {
+      candidate.route = `${candidate.route}:${timestamp}`;
+      candidate.error = snap.error;
+    });
+    candidates.push(...snapshotCandidates.slice(0, 4));
+    if (snapshotCandidates[0]?.score >= 82 && options.performanceProfile !== "maximum") break;
   }
-
-  return best;
-}
-
-function emptyMetadata(): ArticleMetadata {
-  return { title: "", author: "", date: "", siteName: "", canonicalUrl: "" };
+  return candidates.length ? candidates.sort((a, b) => b.score - a.score).slice(0, 12) : [makeCandidate({ text: "", route: "wayback", sourceUrl: cdxUrl, statusCode: 200, error: "No usable Wayback text found." })];
 }
 
 function routeOrder(options: ProcessOptions): string[] {
   const route = options.recoveryRoute;
   let order: string[];
-
   if (route === "archive-only") order = ["wayback"];
   else if (route === "live-only") order = ["live"];
   else if (route === "fast") order = ["live", "jina"];
   else if (route === "archive-first") order = ["wayback", "live", "jina"];
   else if (route === "live-first") order = ["live", "jina", "wayback"];
   else order = ["live", "jina", "wayback"];
-
   if (!options.useJina) order = order.filter((item) => item !== "jina");
   if (!options.useWayback) order = order.filter((item) => item !== "wayback");
-
   return order;
 }
 
 export function tunePerformanceOptions(options: ProcessOptions): ProcessOptions {
   if (options.performanceProfile === "fast") {
-    return {
-      ...options,
-      recoveryRoute: options.recoveryRoute === "balanced" ? "fast" : options.recoveryRoute,
-      retries: Math.min(options.retries, 2),
-      timeoutMs: Math.min(options.timeoutMs, 12_000),
-      useWayback: options.recoveryRoute.includes("archive") ? options.useWayback : false
-    };
+    return { ...options, recoveryRoute: options.recoveryRoute === "balanced" ? "fast" : options.recoveryRoute, retries: Math.min(options.retries, 2), timeoutMs: Math.min(options.timeoutMs, 12_000), useWayback: options.recoveryRoute.includes("archive") ? options.useWayback : false };
   }
-
   if (options.performanceProfile === "maximum") {
-    return {
-      ...options,
-      retries: Math.max(options.retries, 4),
-      timeoutMs: Math.max(options.timeoutMs, 20_000),
-      useJina: true,
-      useWayback: true
-    };
+    return { ...options, retries: Math.max(options.retries, 4), timeoutMs: Math.max(options.timeoutMs, 20_000), useJina: true, useWayback: true };
   }
-
   return options;
+}
+
+function attemptFromCandidate(candidate: Candidate, selected = false): ExtractionAttempt {
+  const quality = classifyQuality(candidate.text, 300, candidate.statusCode);
+  return {
+    route: candidate.route,
+    sourceUrl: candidate.sourceUrl,
+    statusCode: candidate.statusCode,
+    chars: candidate.metrics.chars,
+    words: candidate.metrics.words,
+    paragraphs: candidate.metrics.paragraphs,
+    score: Math.round(candidate.score * 10) / 10,
+    label: quality.label,
+    error: candidate.error || quality.error,
+    title: candidate.metadata.title,
+    author: candidate.metadata.author,
+    boilerplateRatio: candidate.boilerplateRatio,
+    duplicateParagraphRatio: candidate.duplicateParagraphRatio,
+    selected
+  };
 }
 
 export async function processSingleUrl(rawUrl: string, row: RowRecord, options: ProcessOptions): Promise<ScrapeResult> {
   const started = Date.now();
   const url = normalizeUrl(rawUrl);
-
   if (!url) {
-    return baseResult(row, {
-      quality_label: "url_only",
-      error_message: "Invalid or missing URL.",
-      elapsed_s: 0
-    });
+    return baseResult(row, { quality_label: "url_only", error_message: "Invalid or missing URL.", elapsed_s: 0 });
   }
+
+  const cached = getCached(url, options);
+  if (cached) return { ...cached, ...row, from_cache: true } as ScrapeResult;
 
   const robots = await robotsAllowed(url, options);
   if (!robots.allowed) {
-    return baseResult(row, {
-      quality_label: "robots_disallowed",
-      error_message: robots.note,
-      source_url_used: url,
-      recovery_route: "robots",
-      robots_note: robots.note,
-      elapsed_s: (Date.now() - started) / 1000
-    });
+    return baseResult(row, { quality_label: "robots_disallowed", error_message: robots.note, source_url_used: url, recovery_route: "robots", robots_note: robots.note, elapsed_s: (Date.now() - started) / 1000 });
   }
 
   const candidates: Candidate[] = [];
   const errors: string[] = [];
-
   for (const route of routeOrder(options)) {
-    let candidate: Candidate;
-    if (route === "live") candidate = await executeLive(url, options);
-    else if (route === "jina") candidate = await executeJina(url, options);
-    else candidate = await executeWayback(url, options);
+    let routeCandidates: Candidate[];
+    if (route === "live") routeCandidates = await executeLive(url, options);
+    else if (route === "jina") routeCandidates = await executeJina(url, options);
+    else routeCandidates = await executeWayback(url, options);
 
-    candidates.push(candidate);
-    if (candidate.error) errors.push(`${route}: ${candidate.error}`);
-
-    const quality = classifyQuality(candidate.text, options.minChars, candidate.statusCode);
-    if (quality.label === "full_text") break;
+    candidates.push(...routeCandidates);
+    routeCandidates.filter((candidate) => candidate.error).forEach((candidate) => errors.push(`${candidate.route}: ${candidate.error}`));
+    const bestForRoute = routeCandidates.sort((a, b) => b.score - a.score)[0];
+    const quality = bestForRoute ? classifyQuality(bestForRoute.text, options.minChars, bestForRoute.statusCode) : { label: "failed" };
+    if (quality.label === "full_text" && options.performanceProfile !== "maximum") break;
   }
 
-  const best = candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)[0] ?? {
-    text: "",
-    route: "none",
-    sourceUrl: url,
-    statusCode: "",
-    metadata: emptyMetadata(),
-    score: 0,
-    error: "No extraction route produced a candidate."
-  };
-
+  const best = candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)[0] ?? makeCandidate({ text: "", route: "none", sourceUrl: url, statusCode: "", error: "No extraction route produced a candidate." });
   const finalText = collapseWhitespace(best.text);
   const quality = classifyQuality(finalText, options.minChars, best.statusCode);
   const metrics = contentMetrics(finalText);
+  const attempts = candidates.map((candidate) => attemptFromCandidate(candidate, candidate === best));
+  const candidateRoutes = Array.from(new Set(candidates.map((candidate) => candidate.route))).join(" | ");
 
-  return baseResult(row, {
+  const result = baseResult(row, {
     quality_label: quality.label,
     error_message: quality.error || errors.join("; ").slice(0, 500),
     fetched_text: finalText,
@@ -745,10 +751,19 @@ export async function processSingleUrl(rawUrl: string, row: RowRecord, options: 
     word_count: metrics.words,
     char_count: metrics.chars,
     paragraph_count: metrics.paragraphs,
-    extraction_score: best.score,
+    extraction_score: Math.round(best.score * 10) / 10,
     robots_note: robots.note,
-    elapsed_s: Math.round(((Date.now() - started) / 1000) * 100) / 100
+    elapsed_s: Math.round(((Date.now() - started) / 1000) * 100) / 100,
+    candidate_count: candidates.length,
+    winning_candidate_route: best.route,
+    candidate_routes: candidateRoutes,
+    extraction_confidence_label: confidenceLabel(best.score, quality.label),
+    boilerplate_ratio: best.boilerplateRatio,
+    duplicate_paragraph_ratio: best.duplicateParagraphRatio,
+    extraction_trace_json: JSON.stringify(attempts)
   });
+  setCached(url, options, result);
+  return result;
 }
 
 function baseResult(row: RowRecord, patch: Partial<ScrapeResult>): ScrapeResult {
@@ -771,6 +786,13 @@ function baseResult(row: RowRecord, patch: Partial<ScrapeResult>): ScrapeResult 
     extraction_score: 0,
     robots_note: "",
     elapsed_s: 0,
+    candidate_count: 0,
+    winning_candidate_route: "",
+    candidate_routes: "",
+    extraction_confidence_label: "blocked_or_failed",
+    boilerplate_ratio: 0,
+    duplicate_paragraph_ratio: 0,
+    extraction_trace_json: "[]",
     ...patch
   };
 }

@@ -8,6 +8,21 @@ function safeString(value: unknown): string {
   return String(value ?? "").trim();
 }
 
+function safeHttpBaseUrl(value: unknown): string | undefined {
+  const raw = safeString(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  if (!raw) return undefined;
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol)) return undefined;
+    parsed.hash = "";
+    parsed.search = "";
+    return parsed.toString().replace(/\/$/, "");
+  } catch {
+    return undefined;
+  }
+}
+
+
 function clampScore(value: unknown, fallback = 0): number {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
@@ -18,6 +33,22 @@ function normalizeList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((item) => safeString(item)).filter(Boolean).slice(0, 12);
   if (typeof value === "string" && value.trim()) return value.split(/[,|]\s*/).map((item) => item.trim()).filter(Boolean).slice(0, 12);
   return [];
+}
+
+function normalizeEvidence(value: unknown): Array<{ claim: string; quote: string; relevance: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const record = item as Record<string, unknown>;
+      const claim = safeString(record.claim ?? record.point ?? record.label);
+      const quote = safeString(record.quote ?? record.evidence ?? record.text);
+      const relevance = safeString(record.relevance ?? record.reason ?? record.note);
+      if (!claim && !quote) return null;
+      return { claim, quote, relevance };
+    })
+    .filter(Boolean)
+    .slice(0, 8) as Array<{ claim: string; quote: string; relevance: string }>;
 }
 
 function providerLabel(provider: Provider): string {
@@ -54,6 +85,11 @@ function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult
   return {
     quality_score: 0,
     summary_alignment_score: 0,
+    extraction_completeness_score: 0,
+    article_relevance_score: 0,
+    source_reliability_score: 0,
+    national_outlet_confidence: 0,
+    outlet_country_confidence: 0,
     status,
     ai_verification_status: status,
     headline,
@@ -66,7 +102,14 @@ function fallbackAi(metadata: RowRecord, status: string, note: string): AiResult
     summary_alignment_notes: note,
     key_entities: [],
     key_quotes: [],
-    tone_and_bias: ""
+    evidence: [],
+    evidence_json: "[]",
+    evidence_count: 0,
+    tone_and_bias: "",
+    rubric_version: "fallback",
+    model_used: "",
+    provider_used: "huit",
+    analyzed_at: new Date().toISOString()
   };
 }
 
@@ -83,14 +126,20 @@ function extractJson(raw: string): Record<string, unknown> {
   return JSON.parse(match[0]) as Record<string, unknown>;
 }
 
-function normalizeAiJson(parsed: Record<string, unknown>, metadata: RowRecord): AiResult {
+function normalizeAiJson(parsed: Record<string, unknown>, metadata: RowRecord, options: ProcessOptions): AiResult {
   const status = safeString(parsed.ai_verification_status ?? parsed.status ?? parsed.verification_status ?? "UNKNOWN").toUpperCase();
   const executiveSummary = safeString(parsed.executive_summary ?? parsed.deep_summary ?? parsed.summary);
   const notes = safeString(parsed.summary_alignment_notes ?? parsed.reasoning ?? parsed.alignment_reasoning);
+  const evidence = normalizeEvidence(parsed.evidence ?? parsed.supporting_evidence ?? parsed.evidence_quotes);
 
   return {
     quality_score: clampScore(parsed.quality_score, 50),
     summary_alignment_score: clampScore(parsed.summary_alignment_score, 0),
+    extraction_completeness_score: clampScore(parsed.extraction_completeness_score ?? parsed.completeness_score, 0),
+    article_relevance_score: clampScore(parsed.article_relevance_score ?? parsed.relevance_score, 0),
+    source_reliability_score: clampScore(parsed.source_reliability_score ?? parsed.source_score, 0),
+    national_outlet_confidence: clampScore(parsed.national_outlet_confidence, Boolean(parsed.is_national_outlet) ? 75 : 0),
+    outlet_country_confidence: clampScore(parsed.outlet_country_confidence, safeString(parsed.outlet_country) ? 70 : 0),
     status,
     ai_verification_status: status,
     headline: safeString(parsed.headline ?? metadata.extracted_headline ?? metadata.headline ?? metadata.title),
@@ -103,7 +152,14 @@ function normalizeAiJson(parsed: Record<string, unknown>, metadata: RowRecord): 
     summary_alignment_notes: notes,
     key_entities: normalizeList(parsed.key_entities),
     key_quotes: normalizeList(parsed.key_quotes),
-    tone_and_bias: safeString(parsed.tone_and_bias)
+    evidence,
+    evidence_json: JSON.stringify(evidence),
+    evidence_count: evidence.length,
+    tone_and_bias: safeString(parsed.tone_and_bias),
+    rubric_version: safeString(parsed.rubric_version ?? "archivelens-v3"),
+    model_used: safeString(options.aiModel),
+    provider_used: options.aiProvider,
+    analyzed_at: new Date().toISOString()
   };
 }
 
@@ -133,10 +189,15 @@ export function apiKeyFor(options: ProcessOptions): string {
 
 export function baseUrlFor(options: ProcessOptions): string | undefined {
   if (options.aiProvider === "huit") {
-    return safeString(options.huitBaseUrl || options.aiBaseUrl || process.env.HUIT_OPENAI_BASE_URL) || HUIT_DEFAULT_BASE_URL;
+    return (
+      safeHttpBaseUrl(options.huitBaseUrl)
+      || safeHttpBaseUrl(options.aiBaseUrl)
+      || safeHttpBaseUrl(process.env.HUIT_OPENAI_BASE_URL)
+      || HUIT_DEFAULT_BASE_URL
+    );
   }
   if (options.aiProvider === "openai") {
-    return safeString(options.openaiBaseUrl || options.aiBaseUrl) || undefined;
+    return safeHttpBaseUrl(options.openaiBaseUrl) || safeHttpBaseUrl(options.aiBaseUrl);
   }
   return undefined;
 }
@@ -151,7 +212,13 @@ function openAiClient(options: ProcessOptions): OpenAI {
   const apiKey = apiKeyFor(options);
   if (!apiKey) throw new Error(`Missing ${options.aiProvider === "huit" ? "HUIT/OpenAI" : "OpenAI"} API key.`);
   const defaultHeaders = options.aiProvider === "huit" && !apiKey.startsWith("sk-") ? { "api-key": apiKey, "x-api-key": apiKey } : undefined;
-  return new OpenAI({ apiKey, baseURL: baseUrlFor(options), defaultHeaders });
+  const baseURL = baseUrlFor(options);
+  try {
+    return new OpenAI({ apiKey, baseURL, defaultHeaders });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not initialize ${providerLabel(options.aiProvider)} client. Check the API key and base URL. Base URL being used: ${baseURL || "OpenAI default"}. Details: ${detail}`);
+  }
 }
 
 async function callOpenAi(prompt: string, systemPrompt: string, options: ProcessOptions, jsonMode: boolean): Promise<string> {
@@ -230,13 +297,13 @@ export async function analyzeArticle(row: RowRecord, options: ProcessOptions): P
   const providedSummary = summaryColumn ? safeString(row[summaryColumn]) : "";
   const customRubric = safeString(options.customRubric) || "Evaluate whether the recovered article is complete, relevant, and aligned with the provided dataset summary.";
 
-  const systemPrompt = `You are ArchiveLens, an article verification and triage engine. Evaluate only the visible recovered text. Do not infer hidden/paywalled content. If the text is a paywall, login screen, bot-block page, privacy policy, or unrelated page, flag it. Return only valid JSON with these keys: quality_score, summary_alignment_score, summary_alignment_notes, ai_verification_status, headline, author, is_national_outlet, outlet_country, executive_summary, key_entities, key_quotes, tone_and_bias. Valid ai_verification_status values: VERIFIED_PASSED, PARTIAL_TRUNCATED, FAILED_SUMMARY_ALIGNMENT, FLAGGED_PAYWALL_OR_ERROR, LOW_RELEVANCE, NEEDS_MANUAL_REVIEW. Apply this user rubric strictly: ${customRubric}`;
+  const systemPrompt = `You are ArchiveLens v3, an evidence-linked article verification and triage engine. Evaluate only the visible recovered text. Do not infer hidden/paywalled content. If the text is a paywall, login screen, bot-block page, privacy policy, archive shell, or unrelated page, flag it. Return only valid JSON with these keys: quality_score, extraction_completeness_score, article_relevance_score, source_reliability_score, summary_alignment_score, summary_alignment_notes, ai_verification_status, headline, author, is_national_outlet, national_outlet_confidence, outlet_country, outlet_country_confidence, executive_summary, key_entities, key_quotes, evidence, tone_and_bias, rubric_version. evidence must be an array of objects with claim, quote, and relevance, using only short quotes visibly present in the recovered text. Valid ai_verification_status values: VERIFIED_PASSED, PARTIAL_TRUNCATED, FAILED_SUMMARY_ALIGNMENT, FLAGGED_PAYWALL_OR_ERROR, LOW_RELEVANCE, NEEDS_MANUAL_REVIEW. Apply this user rubric strictly: ${customRubric}`;
 
   const prompt = `URL: ${safeString(row.source_url_used ?? row.url ?? row.link)}\nVisible title metadata: ${safeString(row.extracted_headline ?? row.headline ?? row.title)}\nVisible author metadata: ${safeString(row.extracted_author ?? row.author)}\nRecovery label: ${safeString(row.quality_label)}\nProvided original summary from dataset: ${providedSummary || "None provided"}\n\nRecovered article evidence pack:\n${evidencePack(text)}`;
 
   try {
     const raw = options.aiProvider === "gemini" ? await callGemini(prompt, systemPrompt, options, true) : await callOpenAi(prompt, systemPrompt, options, true);
-    return normalizeAiJson(extractJson(raw), row);
+    return normalizeAiJson(extractJson(raw), row, options);
   } catch (error) {
     const note = error instanceof Error ? error.message : String(error);
     return fallbackAi(row, "API_ERROR", note.slice(0, 500));
